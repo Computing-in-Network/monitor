@@ -89,3 +89,18 @@
   - `uv venv --python /usr/bin/python3.10 .venv310 && source .venv310/bin/activate && uv pip install -r requirements.txt httpx`
 - 运行：
   - `python scripts/test_fault_api.py`
+
+## 前端聚合 BFF（I-036）
+- 统一前缀：`/api/v1/bff/*`
+- 路由：
+  - `GET /api/v1/bff/snapshot`
+  - `GET /api/v1/bff/series`
+  - `GET /api/v1/bff/forecast/lstm`
+  - `POST /api/v1/bff/fault/spread`
+  - `POST /api/v1/bff/fault/task-impact`
+- 说明：
+  - BFF 为薄聚合层，当前复用已有业务实现与响应结构
+  - `snapshot` 保持 ETag/304 兼容
+
+## BFF 自测
+- `python scripts/test_bff_api.py`
