@@ -15,6 +15,8 @@
   - 支持条件请求：`If-None-Match` 命中后返回 `304`
 - `GET /api/v1/ops/failed-events`：查看失败事件审计与状态
 - `POST /api/v1/ops/failed-events/replay`：手动重放失败事件
+- `GET /api/v1/analysis/forecast/models`：查询已注册预测模型列表
+- `GET /api/v1/analysis/forecast/lstm`：预测查询（支持注册模型优先，fallback 兜底）
 - `POST /api/v1/ingest/{kind}`：上报入口
   - kind 取值：`node_metric`、`node-metric`、`link_metric`、`link-metric`、`flow`、`alarm`
 - Header：
@@ -52,7 +54,20 @@
 - `TSDB_ENABLED`：是否启用 Timescale 写入（默认 `true`）
 - `TSDB_DSN`：Timescale 连接串
 - `TSDB_SCHEMA`：写入 schema（默认 `monitor_ts`）
+- `FORECAST_MODEL_DIR`：预测模型目录（默认 `/tmp/forecast_models/lstm`）
 
 ## Timescale 写入
 - 入站事件在发布 NATS 成功后会尝试写入 Timescale（四类表）
 - 写库失败不会阻断主请求，会记录 `DB_WRITE_FAILED` 并进入 failed-events 审计
+
+## 预测服务编排（I-034）
+- `GET /api/v1/analysis/forecast/models`
+  - 返回模型注册列表（`model_id/version/backend/validation_mape`）
+- `GET /api/v1/analysis/forecast/lstm`
+  - 参数：
+    - 必填：`event_type/metric/entity_id`
+    - 可选：`model_id/model_version/strategy(auto|registered|fallback)`、`horizon/window/history_limit/topology_epoch`
+  - 返回：
+    - `model_type/model_id/model_version/strategy`
+    - `validation_mape`（有训练模型时）
+    - `points` 预测点

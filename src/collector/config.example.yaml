@@ -10,3 +10,4 @@ failed_events_audit_file: /tmp/collector_failed_events.jsonl
 tsdb_enabled: true
 tsdb_dsn: postgresql://monitor:monitor123@monitor_timescaledb:5432/monitor
 tsdb_schema: monitor_ts
+forecast_model_dir: /tmp/forecast_models/lstm
