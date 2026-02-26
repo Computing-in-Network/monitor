@@ -112,3 +112,12 @@
 
 ## SLO 自测
 - `python scripts/test_slo_api.py`
+
+## 自动告警发现（I-039）
+- `POST /api/v1/analysis/alarm/discover`
+- `POST /api/v1/bff/analysis/alarm/discover`
+  - 参数：`scope_type(network|node|link)`、`scope_id`、`topology_epoch`、`strategies(threshold|baseline)`
+  - 返回：`detected_alarms[]`、`summary`
+
+## 告警发现自测
+- `python scripts/test_alarm_discovery_api.py`
