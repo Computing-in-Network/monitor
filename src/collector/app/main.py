@@ -9,8 +9,9 @@ from .config import load_config
 from .failed_events import FailedEventStore
 from .observability import OutcomeStats
 from .publisher import EventPublisher
+from .rate_limit import ProducerRateLimiter
 from .repository import IdempotentStore
-from .routes import router
+from .routes import router, router_v2
 from .snapshot import MonitorSnapshotStore
 from .storage import TimescaleWriter
 
@@ -20,6 +21,7 @@ def create_app() -> FastAPI:
 
     app = FastAPI(title="net-analysis collector")
     app.include_router(router)
+    app.include_router(router_v2)
 
     app.state.config = config
     app.state.publisher = EventPublisher(
@@ -34,6 +36,7 @@ def create_app() -> FastAPI:
         max_items=config.failed_events_max_items,
         audit_file_path=config.failed_events_audit_file,
     )
+    app.state.rate_limiter = ProducerRateLimiter(rpm=config.producer_rate_limit_rpm)
     app.state.ts_writer = None
     if config.tsdb_enabled:
         app.state.ts_writer = TimescaleWriter(config.tsdb_dsn, schema=config.tsdb_schema)

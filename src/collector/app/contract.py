@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-SCHEMA_VERSION = "monitor.v1"
+SCHEMA_VERSIONS = {"monitor.v1", "monitor.v2"}
 
 ALLOWED_NODE_STATUS = {"UP", "DOWN", "DEGRADED"}
 ALLOWED_LINK_STATE = {"UP", "DOWN", "DEGRADED"}
@@ -40,8 +40,8 @@ def _check_ratio(payload: dict[str, Any], key: str) -> None:
 def validate_common(payload: dict[str, Any]) -> None:
     _require(payload, "schema_version")
     _require(payload, "message_id")
-    if payload.get("schema_version") != SCHEMA_VERSION:
-        raise ContractError("INVALID_PAYLOAD", "schema_version 必须为 monitor.v1")
+    if payload.get("schema_version") not in SCHEMA_VERSIONS:
+        raise ContractError("INVALID_PAYLOAD", "schema_version 仅支持 monitor.v1|monitor.v2")
 
 
 def validate_payload(event_type: str, payload: dict[str, Any]) -> None:
