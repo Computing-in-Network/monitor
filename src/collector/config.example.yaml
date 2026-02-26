@@ -1,0 +1,12 @@
+environment: dev
+nats_url: nats://nats:4222
+api_token: "change-me"
+idempotency_ttl: 300
+topic_prefix: raw
+publish_retries: 2
+publish_retry_backoff_ms: 200
+failed_events_max_items: 2000
+failed_events_audit_file: /tmp/collector_failed_events.jsonl
+tsdb_enabled: true
+tsdb_dsn: postgresql://monitor:monitor123@monitor_timescaledb:5432/monitor
+tsdb_schema: monitor_ts
