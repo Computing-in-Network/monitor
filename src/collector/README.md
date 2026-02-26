@@ -15,6 +15,9 @@
   - 支持条件请求：`If-None-Match` 命中后返回 `304`
 - `GET /api/v1/ops/failed-events`：查看失败事件审计与状态
 - `POST /api/v1/ops/failed-events/replay`：手动重放失败事件
+- `GET /api/v1/monitor/series`：Timescale 查询网关（统一时序查询）
+  - 必填参数：`event_type`、`metric`、`entity_id`
+  - 可选参数：`topology_epoch`、`limit`、`start`、`end`、`bucket_sec`、`agg(avg|max|min)`
 - `POST /api/v1/ingest/{kind}`：上报入口
   - kind 取值：`node_metric`、`node-metric`、`link_metric`、`link-metric`、`flow`、`alarm`
 - Header：
@@ -56,3 +59,12 @@
 ## Timescale 写入
 - 入站事件在发布 NATS 成功后会尝试写入 Timescale（四类表）
 - 写库失败不会阻断主请求，会记录 `DB_WRITE_FAILED` 并进入 failed-events 审计
+
+## Timescale 查询网关（I-033）
+- 查询结果统一返回：
+  - `source=timescaledb`
+  - `query`（入参回显）
+  - `range`（返回数据时间范围）
+  - `points` + `count`
+- 支持按时间窗口查询（`start/end`）
+- 支持按桶聚合降采样（`bucket_sec + agg`）

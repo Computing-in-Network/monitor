@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
+from datetime import datetime
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Request, Response
@@ -102,10 +103,18 @@ def create_app() -> FastAPI:
         entity_id: str,
         topology_epoch: Optional[str] = None,
         limit: int = 120,
+        start: Optional[str] = None,
+        end: Optional[str] = None,
+        bucket_sec: Optional[int] = None,
+        agg: str = "avg",
     ) -> dict[str, object]:
         ts_writer = app.state.ts_writer
         if ts_writer is None or not ts_writer.is_ready():
             raise HTTPException(status_code=503, detail="timescale db not ready")
+        start_dt = _parse_iso_datetime(start, field="start")
+        end_dt = _parse_iso_datetime(end, field="end")
+        if start_dt and end_dt and start_dt > end_dt:
+            raise HTTPException(status_code=422, detail="start 不能晚于 end")
         try:
             points = ts_writer.read_metric_series(
                 event_type=event_type,
@@ -113,9 +122,15 @@ def create_app() -> FastAPI:
                 entity_id=entity_id,
                 limit=limit,
                 topology_epoch=topology_epoch,
+                start=start_dt,
+                end=end_dt,
+                bucket_sec=bucket_sec,
+                agg=agg,
             )
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        ts_start = points[0]["ts"] if points else None
+        ts_end = points[-1]["ts"] if points else None
         return {
             "status": "ok",
             "source": "timescaledb",
@@ -123,8 +138,16 @@ def create_app() -> FastAPI:
             "metric": metric,
             "entity_id": entity_id,
             "topology_epoch": topology_epoch,
+            "query": {
+                "limit": limit,
+                "start": start,
+                "end": end,
+                "bucket_sec": bucket_sec,
+                "agg": agg,
+            },
             "points": points,
             "count": len(points),
+            "range": {"start": ts_start, "end": ts_end},
         }
 
     @app.get("/api/v1/analysis/forecast/lstm")
@@ -233,3 +256,13 @@ def _forecast_wma(values: list[float], window: int, steps: int) -> list[float]:
 
 
 app = create_app()
+
+
+def _parse_iso_datetime(raw: Optional[str], *, field: str) -> datetime | None:
+    if raw in (None, ""):
+        return None
+    text = str(raw).strip()
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=f"{field} 需为 ISO-8601 时间格式") from exc
