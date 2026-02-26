@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 import time
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException, Request, Response
 
@@ -468,6 +468,119 @@ def create_app() -> FastAPI:
     async def bff_discover_alarms(payload: dict[str, object]) -> dict[str, object]:
         return await discover_alarms(payload=payload)
 
+    @app.post("/api/v1/bff/analysis/global-impact")
+    async def bff_global_impact(payload: dict[str, object]) -> dict[str, object]:
+        start = time.perf_counter()
+        ok = False
+        try:
+            topology_epoch = str(payload.get("topology_epoch")) if payload.get("topology_epoch") not in (None, "") else None
+            mode = str(payload.get("mode", "global")).strip().lower()
+            if mode not in {"global", "focused", "auto"}:
+                raise HTTPException(status_code=422, detail="mode 仅支持 global|focused|auto")
+            scope_type = str(payload.get("scope_type", "network")).strip().lower()
+            scope_id = str(payload.get("scope_id", "all")).strip()
+            if scope_type not in {"network", "node", "link"}:
+                raise HTTPException(status_code=422, detail="scope_type 仅支持 network|node|link")
+
+            snapshot_payload = app.state.snapshot_store.snapshot(topology_epoch=topology_epoch)
+            monitor = snapshot_payload.get("monitor", {}) if isinstance(snapshot_payload, dict) else {}
+            links_map = monitor.get("links", {}) if isinstance(monitor.get("links"), dict) else {}
+            links = [x for x in links_map.values() if isinstance(x, dict)]
+            if not links:
+                raise HTTPException(status_code=422, detail="INSUFFICIENT_DATA: no topology links in snapshot")
+
+            alarm_scope_type = scope_type if mode == "focused" else "network"
+            alarm_scope_id = scope_id if mode == "focused" else "all"
+            discover_req = DiscoverRequest(
+                topology_epoch=topology_epoch,
+                scope_type=alarm_scope_type,
+                scope_id=alarm_scope_id,
+                window_sec=max(60, min(int(payload.get("window_sec", 300)), 86400)),
+                strategies=[str(x) for x in (payload.get("strategies") or ["threshold", "baseline"])],
+                include_evidence_points=bool(payload.get("include_evidence_points", False)),
+            )
+            discovered = app.state.alarm_discoverer.discover(
+                discover_req,
+                snapshot_payload=snapshot_payload,
+                ts_writer=app.state.ts_writer,
+            )
+            detected = [x for x in (discovered.get("detected_alarms") or []) if isinstance(x, dict)]
+            seed_nodes, seed_links = _extract_seeds(detected)
+            if mode == "focused" and scope_type == "node" and scope_id and scope_id not in seed_nodes:
+                seed_nodes.append(scope_id)
+            if mode == "focused" and scope_type == "link" and scope_id and scope_id not in seed_links:
+                seed_links.append(scope_id)
+
+            if not seed_nodes and not seed_links:
+                alarms = monitor.get("alarms", []) if isinstance(monitor.get("alarms"), list) else []
+                for item in alarms:
+                    if not isinstance(item, dict):
+                        continue
+                    st = str(item.get("scope_type") or "").strip().lower()
+                    sid = str(item.get("scope_uid") or item.get("scope_id") or "").strip()
+                    if st == "node" and sid and sid not in seed_nodes:
+                        seed_nodes.append(sid)
+                    if st == "link" and sid and sid not in seed_links:
+                        seed_links.append(sid)
+
+            alarm_nodes = list(seed_nodes)
+            if not alarm_nodes and seed_links:
+                for lk in links:
+                    uid = str(lk.get("link_uid") or lk.get("link_id") or "")
+                    if uid not in seed_links:
+                        continue
+                    src = str(lk.get("src_node_uid") or lk.get("src_node_id") or "")
+                    dst = str(lk.get("dst_node_uid") or lk.get("dst_node_id") or "")
+                    if src and src not in alarm_nodes:
+                        alarm_nodes.append(src)
+                    if dst and dst not in alarm_nodes:
+                        alarm_nodes.append(dst)
+
+            spread_req = AnalyzeRequest(
+                alarm_nodes=alarm_nodes,
+                links=links,
+                max_depth=max(1, min(int(payload.get("max_depth", 4)), 10)),
+                mode=str(payload.get("spread_mode", "cascade")),
+                cascade_threshold=float(payload.get("cascade_threshold", 0.6)),
+            )
+            spread_result = app.state.fault_spread.analyze(spread_req)
+
+            link_metrics = _extract_link_metrics(links_map)
+            tasks = [x for x in (payload.get("tasks") or []) if isinstance(x, dict)]
+            if not tasks:
+                tasks = _build_global_tasks(link_metrics, max_tasks=max(10, min(int(payload.get("max_tasks", 30)), 100)))
+            impact_req = TaskImpactRequest(
+                tasks=tasks,
+                link_metrics=link_metrics,
+                fault_spread=spread_result,
+                rtt_warn_ms=float(payload.get("rtt_warn_ms", 180.0)),
+                loss_warn_rate=float(payload.get("loss_warn_rate", 0.03)),
+            )
+            impact_result = app.state.task_impact.evaluate(impact_req)
+
+            summary = _global_summary(
+                detected_alarms=detected,
+                spread_result=spread_result,
+                impact_result=impact_result,
+            )
+            out = {
+                "status": "ok",
+                "contract_version": "analysis.v1",
+                "mode": mode,
+                "scope_type": scope_type,
+                "scope_id": scope_id,
+                "topology_epoch": topology_epoch,
+                "summary": summary,
+                "seeds": {"alarm_nodes": alarm_nodes, "alarm_links": seed_links},
+                "detected_alarms": detected,
+                "impact_graph": spread_result,
+                "task_impacts": impact_result,
+            }
+            ok = True
+            return out
+        finally:
+            app.state.slo.record("analysis.global_impact", ok=ok, latency_ms=(time.perf_counter() - start) * 1000.0)
+
     @app.post("/api/v1/ops/failed-events/replay")
     async def replay_failed_events(limit: int = 50) -> dict[str, object]:
         ids = app.state.failed_events.pending_event_ids(limit=limit)
@@ -513,6 +626,107 @@ def _forecast_wma(values: list[float], window: int, steps: int) -> list[float]:
         out.append(float(weighted))
         hist.append(float(weighted))
     return out
+
+
+def _extract_seeds(detected_alarms: list[dict[str, Any]]) -> tuple[list[str], list[str]]:
+    nodes: list[str] = []
+    links: list[str] = []
+    for item in detected_alarms:
+        st = str(item.get("scope_type") or "").strip().lower()
+        sid = str(item.get("scope_id") or "").strip()
+        if not sid:
+            continue
+        if st == "node" and sid not in nodes:
+            nodes.append(sid)
+        if st == "link" and sid not in links:
+            links.append(sid)
+    return nodes, links
+
+
+def _extract_link_metrics(links_map: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    for uid, raw in links_map.items():
+        if not isinstance(raw, dict):
+            continue
+        key = str(raw.get("link_uid") or uid or "").strip()
+        if not key:
+            continue
+        out[key] = {
+            "state": raw.get("state"),
+            "rtt_ms": raw.get("rtt_ms"),
+            "loss_rate": raw.get("loss_rate"),
+        }
+    return out
+
+
+def _build_global_tasks(link_metrics: dict[str, dict[str, Any]], max_tasks: int = 30) -> list[dict[str, Any]]:
+    scored: list[tuple[float, str]] = []
+    for uid, m in link_metrics.items():
+        state = str(m.get("state") or "").upper()
+        rtt = _safe_float(m.get("rtt_ms"))
+        loss = _safe_float(m.get("loss_rate"))
+        score = 0.0
+        if state in {"DOWN", "DISCONNECTED"}:
+            score += 100.0
+        if state in {"DEGRADED"}:
+            score += 40.0
+        score += min(80.0, rtt / 4.0)
+        score += min(60.0, loss * 1200.0)
+        scored.append((score, uid))
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    top = scored[: max(1, max_tasks)]
+    tasks: list[dict[str, Any]] = []
+    for idx, (_, uid) in enumerate(top, start=1):
+        criticality = 0.95 if idx <= 5 else 0.8 if idx <= 15 else 0.65
+        tasks.append(
+            {
+                "task_id": f"global-task-{idx:03d}",
+                "name": f"全网关键链路任务-{idx:03d}",
+                "criticality": criticality,
+                "links": [uid],
+            }
+        )
+    return tasks
+
+
+def _global_summary(
+    detected_alarms: list[dict[str, Any]],
+    spread_result: dict[str, Any],
+    impact_result: dict[str, Any],
+) -> dict[str, Any]:
+    alarms_total = len(detected_alarms)
+    node_alarms = sum(1 for x in detected_alarms if str(x.get("scope_type")) == "node")
+    link_alarms = alarms_total - node_alarms
+    impacted_nodes = len(spread_result.get("impacted_nodes") or [])
+    impacted_links = len(spread_result.get("impacted_links") or [])
+    tasks = [x for x in (impact_result.get("tasks") or []) if isinstance(x, dict)]
+    disconnected = sum(1 for x in tasks if str(x.get("status")) == "disconnected")
+    degraded = sum(1 for x in tasks if str(x.get("status")) == "degraded")
+    avg_priority = round(sum(_safe_float(x.get("priority_score")) for x in tasks) / len(tasks), 2) if tasks else 0.0
+    risk = "normal"
+    if disconnected > 0 or alarms_total >= 20:
+        risk = "critical"
+    elif degraded > 0 or alarms_total >= 5:
+        risk = "warning"
+    return {
+        "risk_level": risk,
+        "detected_alarm_total": alarms_total,
+        "detected_node_alarms": node_alarms,
+        "detected_link_alarms": link_alarms,
+        "impacted_nodes": impacted_nodes,
+        "impacted_links": impacted_links,
+        "task_total": len(tasks),
+        "task_disconnected": disconnected,
+        "task_degraded": degraded,
+        "average_priority_score": avg_priority,
+    }
+
+
+def _safe_float(v: Any) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 app = create_app()
