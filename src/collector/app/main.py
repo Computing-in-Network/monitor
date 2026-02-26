@@ -16,6 +16,7 @@ from .observability import ApiSLOTracker, OutcomeStats
 from .publisher import EventPublisher
 from .repository import IdempotentStore
 from .routes import router
+from .simulation import SimulationManager
 from .snapshot import MonitorSnapshotStore
 from .storage import TimescaleWriter
 
@@ -44,6 +45,7 @@ def create_app() -> FastAPI:
     app.state.alarm_discoverer = AutoAlarmDiscoverer()
     app.state.fault_spread = SpreadAnalyzer()
     app.state.task_impact = TaskImpactService()
+    app.state.simulations = SimulationManager()
     app.state.ts_writer = None
     if config.tsdb_enabled:
         app.state.ts_writer = TimescaleWriter(config.tsdb_dsn, schema=config.tsdb_schema)
@@ -654,6 +656,82 @@ def create_app() -> FastAPI:
             return out
         finally:
             app.state.slo.record("analysis.run", ok=ok, latency_ms=(time.perf_counter() - start) * 1000.0)
+
+    @app.post("/api/v1/bff/simulation/create")
+    async def simulation_create(payload: dict[str, object]) -> dict[str, object]:
+        scenario_type = str(payload.get("scenario_type", "link_down")).strip().lower()
+        if scenario_type not in {"link_down", "node_hotspot", "regional_blackout"}:
+            raise HTTPException(status_code=422, detail="scenario_type 仅支持 link_down|node_hotspot|regional_blackout")
+        topology_epoch = str(payload.get("topology_epoch")) if payload.get("topology_epoch") not in (None, "") else None
+        steps_total = max(1, min(int(payload.get("steps_total", 8)), 100))
+        params = payload.get("params")
+        if not isinstance(params, dict):
+            params = {}
+        session = app.state.simulations.create(
+            scenario_type=scenario_type,
+            topology_epoch=topology_epoch,
+            params=params,
+            steps_total=steps_total,
+        )
+        return {
+            "status": "ok",
+            "simulation_id": session.simulation_id,
+            "scenario_type": session.scenario_type,
+            "steps_total": session.steps_total,
+            "topology_epoch": session.topology_epoch,
+            "created_at": session.created_at,
+        }
+
+    @app.post("/api/v1/bff/simulation/{simulation_id}/step")
+    async def simulation_step(simulation_id: str) -> dict[str, object]:
+        snapshot_payload = app.state.snapshot_store.snapshot(topology_epoch=None)
+        try:
+            session_view = app.state.simulations.step(
+                simulation_id,
+                snapshot_payload=snapshot_payload,
+                alarm_discoverer=app.state.alarm_discoverer,
+                spread_analyzer=app.state.fault_spread,
+                task_impact=app.state.task_impact,
+                ts_writer=app.state.ts_writer,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=f"simulation not found: {simulation_id}") from exc
+        return {"status": "ok", "simulation": session_view}
+
+    @app.get("/api/v1/bff/simulation/{simulation_id}")
+    async def simulation_get(simulation_id: str) -> dict[str, object]:
+        session = app.state.simulations.get(simulation_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail=f"simulation not found: {simulation_id}")
+        return {
+            "status": "ok",
+            "simulation": {
+                "simulation_id": session.simulation_id,
+                "scenario_type": session.scenario_type,
+                "topology_epoch": session.topology_epoch,
+                "params": session.params,
+                "steps_total": session.steps_total,
+                "current_step": session.current_step,
+                "status": session.status,
+                "created_at": session.created_at,
+                "updated_at": session.updated_at,
+                "timeline": session.timeline,
+            },
+        }
+
+    @app.get("/api/v1/bff/simulation/{simulation_id}/timeline")
+    async def simulation_timeline(simulation_id: str) -> dict[str, object]:
+        session = app.state.simulations.get(simulation_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail=f"simulation not found: {simulation_id}")
+        return {
+            "status": "ok",
+            "simulation_id": session.simulation_id,
+            "scenario_type": session.scenario_type,
+            "current_step": session.current_step,
+            "steps_total": session.steps_total,
+            "timeline": session.timeline,
+        }
 
     @app.post("/api/v1/ops/failed-events/replay")
     async def replay_failed_events(limit: int = 50) -> dict[str, object]:
