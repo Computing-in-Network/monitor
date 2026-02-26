@@ -104,3 +104,11 @@
 
 ## BFF 自测
 - `python scripts/test_bff_api.py`
+
+## 可观测与 SLO（I-037）
+- `GET /api/v1/ops/slo`
+  - 汇总维度：`ingest/db/query/forecast/fault`
+  - 输出：可用性、错误率、P95 延迟、SLO 判定
+
+## SLO 自测
+- `python scripts/test_slo_api.py`
