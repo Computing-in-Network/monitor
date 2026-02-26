@@ -38,4 +38,23 @@ def normalize_event_type(raw_type: str) -> str:
 
 
 def build_subject(environment: str, category: str, event_type: str) -> str:
-    return f"{environment}.{category}.{normalize_event_type(event_type)}"
+    entity = normalize_event_type(event_type)
+    return f"{environment}.{category}.{entity}.v1"
+
+
+def build_versioned_subject(environment: str, domain: str, event_type: str, schema_version: str | None) -> str:
+    entity = normalize_event_type(event_type)
+    version = "v1"
+    raw = str(schema_version or "").strip().lower()
+    if raw.startswith("monitor.v"):
+        version = "v" + raw.split("monitor.v", 1)[1]
+    return f"{environment}.{domain}.{entity}.{version}"
+
+
+def build_dlq_subject(environment: str, domain: str, event_type: str, schema_version: str | None) -> str:
+    entity = normalize_event_type(event_type)
+    version = "v1"
+    raw = str(schema_version or "").strip().lower()
+    if raw.startswith("monitor.v"):
+        version = "v" + raw.split("monitor.v", 1)[1]
+    return f"{environment}.dlq.{domain}.{entity}.{version}"

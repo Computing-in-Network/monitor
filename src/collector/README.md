@@ -15,21 +15,25 @@
   - 支持条件请求：`If-None-Match` 命中后返回 `304`
 - `GET /api/v1/ops/failed-events`：查看失败事件审计与状态
 - `POST /api/v1/ops/failed-events/replay`：手动重放失败事件
+  - 参数：`target=original|dlq`（默认 `original`）
 - `POST /api/v1/ingest/{kind}`：上报入口
+- `POST /api/v2/ingest/{kind}`：v2 上报入口（与 v1 并行）
   - kind 取值：`node_metric`、`node-metric`、`link_metric`、`link-metric`、`flow`、`alarm`
 - Header：
   - `x-api-token`：上报鉴权
 
 ## 必填字段
 - 所有事件必须包含：
-  - `schema_version=monitor.v1`
+  - `schema_version=monitor.v1|monitor.v2`
   - `message_id`
 - `timestamp` 缺省可由服务端补齐
 
 ## 错误码
 - `INVALID_PAYLOAD`：字段校验失败
 - `INVALID_KIND`：不支持事件类型
-- `UNAUTHORIZED`：鉴权失败
+- `AUTH_TOKEN_MISSING`：缺少 token
+- `AUTH_TOKEN_INVALID`：token 不匹配
+- `RATE_LIMITED`：同一 producer 触发限流
 - `NATS_UNAVAILABLE`：事件总线不可用
 
 ## 幂等策略
@@ -52,6 +56,20 @@
 - `TSDB_ENABLED`：是否启用 Timescale 写入（默认 `true`）
 - `TSDB_DSN`：Timescale 连接串
 - `TSDB_SCHEMA`：写入 schema（默认 `monitor_ts`）
+- `PRODUCER_RATE_LIMIT_RPM`：按 producer 每分钟限流阈值（`0` 表示关闭）
+
+## Topic 规范（I-031）
+- 事件主题格式：`{environment}.{domain}.{entity}.{version}`
+- 示例：`dev.raw.node_metric.v1`、`dev.raw.link_metric.v2`
+- DLQ 主题格式：`{environment}.dlq.{domain}.{entity}.{version}`
+- 示例：`dev.dlq.raw.node_metric.v1`
+
+## DLQ 与回放
+- NATS 发布失败：失败事件进入 failed-events 审计（状态 `pending`）
+- DB 写入失败：失败事件进入审计，并尝试发布到对应 DLQ 主题
+- 手动回放：
+  - `POST /api/v1/ops/failed-events/replay?target=original`
+  - `POST /api/v1/ops/failed-events/replay?target=dlq`
 
 ## Timescale 写入
 - 入站事件在发布 NATS 成功后会尝试写入 Timescale（四类表）
