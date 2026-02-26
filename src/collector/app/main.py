@@ -276,6 +276,64 @@ def create_app() -> FastAPI:
         result = app.state.task_impact.evaluate(req)
         return {"status": "ok", "result": result}
 
+    @app.get("/api/v1/bff/snapshot")
+    async def bff_snapshot(
+        request: Request,
+        response: Response,
+        topology_epoch: Optional[str] = None,
+    ) -> object:
+        return await monitor_snapshot(request=request, response=response, topology_epoch=topology_epoch)
+
+    @app.get("/api/v1/bff/series")
+    async def bff_series(
+        event_type: str,
+        metric: str,
+        entity_id: str,
+        topology_epoch: Optional[str] = None,
+        limit: int = 120,
+    ) -> dict[str, object]:
+        return await monitor_series(
+            event_type=event_type,
+            metric=metric,
+            entity_id=entity_id,
+            topology_epoch=topology_epoch,
+            limit=limit,
+        )
+
+    @app.get("/api/v1/bff/forecast/lstm")
+    async def bff_forecast_lstm(
+        event_type: str,
+        metric: str,
+        entity_id: str,
+        topology_epoch: Optional[str] = None,
+        horizon: int = 12,
+        window: int = 12,
+        history_limit: int = 240,
+        model_id: Optional[str] = None,
+        model_version: Optional[str] = None,
+        strategy: str = "auto",
+    ) -> dict[str, object]:
+        return await forecast_lstm(
+            event_type=event_type,
+            metric=metric,
+            entity_id=entity_id,
+            topology_epoch=topology_epoch,
+            horizon=horizon,
+            window=window,
+            history_limit=history_limit,
+            model_id=model_id,
+            model_version=model_version,
+            strategy=strategy,
+        )
+
+    @app.post("/api/v1/bff/fault/spread")
+    async def bff_fault_spread(payload: dict[str, object]) -> dict[str, object]:
+        return await fault_spread(payload=payload)
+
+    @app.post("/api/v1/bff/fault/task-impact")
+    async def bff_fault_task_impact(payload: dict[str, object]) -> dict[str, object]:
+        return await fault_task_impact(payload=payload)
+
     @app.post("/api/v1/ops/failed-events/replay")
     async def replay_failed_events(limit: int = 50) -> dict[str, object]:
         ids = app.state.failed_events.pending_event_ids(limit=limit)
