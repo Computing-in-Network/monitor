@@ -13,7 +13,7 @@ from .config import CollectorConfig
 from .contract import ContractError, validate_payload
 from .failed_events import FailedEventStore
 from .middleware.auth import validate_api_token
-from .events import build_subject, normalize_event_type
+from .events import build_dlq_subject, build_versioned_subject, normalize_event_type
 from .mapping import normalize_payload, validate_alarm_mapping
 from .observability import OutcomeStats
 from .publisher import EventPublisher, PublishUnavailableError
@@ -135,6 +135,7 @@ async def _ingest_impl(
     event_type = _normalize_kind(kind)
     message_id = str(payload.get("message_id") or "")
     producer = _producer_id(request, payload)
+    schema_version = str(payload.get("schema_version") or "monitor.v1")
 
     if kind not in ALLOWED_KINDS:
         stats.record("INVALID_KIND", event_type=event_type, producer=producer)
@@ -210,7 +211,8 @@ async def _ingest_impl(
     if "timestamp" not in payload:
         payload["timestamp"] = datetime.now(timezone.utc).isoformat()
 
-    topic = build_subject(config.environment, config.topic_prefix, event_type)
+    topic = build_versioned_subject(config.environment, config.topic_prefix, event_type, schema_version)
+    dlq_subject = build_dlq_subject(config.environment, config.topic_prefix, event_type, schema_version)
     event_message = {
         "event_type": event_type,
         "payload": payload,
@@ -229,6 +231,10 @@ async def _ingest_impl(
             trace_id=trace_id,
             subject=topic,
             payload=event_message,
+            producer=producer,
+            event_type=event_type,
+            schema_version=schema_version,
+            dlq_subject=dlq_subject,
             error_code="NATS_UNAVAILABLE",
             error_message="事件总线不可用，投递失败",
         )
@@ -250,9 +256,32 @@ async def _ingest_impl(
                 trace_id=trace_id,
                 subject="timescale.write",
                 payload={"event_type": event_type, "payload": payload},
+                producer=producer,
+                event_type=event_type,
+                schema_version=schema_version,
+                dlq_subject=dlq_subject,
                 error_code="DB_WRITE_FAILED",
                 error_message=str(e),
             )
+            # NATS connected but DB write failed: route structured error event to DLQ topic.
+            try:
+                await publisher.publish(
+                    dlq_subject,
+                    {
+                        "event_type": event_type,
+                        "schema_version": schema_version,
+                        "producer": producer,
+                        "trace_id": trace_id,
+                        "error_code": "DB_WRITE_FAILED",
+                        "error_message": str(e),
+                        "failed_subject": topic,
+                        "payload": payload,
+                        "received_at": datetime.now(timezone.utc).isoformat(),
+                    },
+                )
+                stats.record("DLQ_PUBLISHED", event_type=event_type, producer=producer)
+            except PublishUnavailableError:
+                stats.record("DLQ_PUBLISH_FAILED", event_type=event_type, producer=producer)
     stats.record("OK", event_type=event_type, producer=producer)
     _audit(request, trace_id, "OK", event_type, message_id)
     return {

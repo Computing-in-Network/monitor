@@ -64,7 +64,11 @@ def create_app() -> FastAPI:
 
     @app.get("/metrics")
     async def metrics() -> dict[str, object]:
-        return app.state.stats.snapshot()
+        return {
+            **app.state.stats.snapshot(),
+            "publisher": app.state.publisher.stats(),
+            "failed_events": app.state.failed_events.summary(),
+        }
 
     @app.get("/api/v1/monitor/snapshot")
     async def monitor_snapshot(
@@ -189,7 +193,10 @@ def create_app() -> FastAPI:
         }
 
     @app.post("/api/v1/ops/failed-events/replay")
-    async def replay_failed_events(limit: int = 50) -> dict[str, object]:
+    async def replay_failed_events(limit: int = 50, target: str = "original") -> dict[str, object]:
+        replay_target = str(target or "original").strip().lower()
+        if replay_target not in {"original", "dlq"}:
+            raise HTTPException(status_code=422, detail="target 仅支持 original|dlq")
         ids = app.state.failed_events.pending_event_ids(limit=limit)
         attempted = 0
         replayed = 0
@@ -201,13 +208,28 @@ def create_app() -> FastAPI:
                 continue
             attempted += 1
             try:
+                subject = str(event.get("subject") or "")
+                payload = dict(event.get("payload") or {})
+                if replay_target == "dlq":
+                    subject = str(event.get("dlq_subject") or subject)
+                    payload = {
+                        "source": "manual-replay",
+                        "trace_id": event.get("trace_id"),
+                        "event_type": event.get("event_type"),
+                        "schema_version": event.get("schema_version"),
+                        "producer": event.get("producer"),
+                        "error_code": event.get("error_code"),
+                        "error_message": event.get("error_message"),
+                        "failed_subject": event.get("subject"),
+                        "payload": event.get("payload"),
+                    }
                 await app.state.publisher.publish(
-                    str(event.get("subject") or ""),
-                    dict(event.get("payload") or {}),
+                    subject,
+                    payload,
                 )
                 app.state.failed_events.mark_replay(event_id, success=True)
                 replayed += 1
-                details.append({"id": event_id, "status": "replayed"})
+                details.append({"id": event_id, "status": "replayed", "target": replay_target, "subject": subject})
             except Exception as exc:  # noqa: BLE001
                 app.state.failed_events.mark_replay(event_id, success=False, replay_error=str(exc))
                 failed += 1
@@ -216,6 +238,7 @@ def create_app() -> FastAPI:
             "attempted": attempted,
             "replayed": replayed,
             "failed": failed,
+            "target": replay_target,
             "details": details,
             "summary": app.state.failed_events.summary(),
         }

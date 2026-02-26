@@ -21,6 +21,10 @@ class FailedEvent:
     trace_id: str
     subject: str
     payload: dict[str, Any]
+    producer: str
+    event_type: str
+    schema_version: str
+    dlq_subject: str
     error_code: str
     error_message: str
     status: str = "pending"
@@ -35,6 +39,10 @@ class FailedEvent:
             "trace_id": self.trace_id,
             "subject": self.subject,
             "payload": self.payload,
+            "producer": self.producer,
+            "event_type": self.event_type,
+            "schema_version": self.schema_version,
+            "dlq_subject": self.dlq_subject,
             "error_code": self.error_code,
             "error_message": self.error_message,
             "status": self.status,
@@ -69,6 +77,10 @@ class FailedEventStore:
         trace_id: str,
         subject: str,
         payload: dict[str, Any],
+        producer: str,
+        event_type: str,
+        schema_version: str,
+        dlq_subject: str,
         error_code: str,
         error_message: str,
     ) -> dict[str, Any]:
@@ -78,6 +90,10 @@ class FailedEventStore:
             trace_id=trace_id,
             subject=subject,
             payload=payload,
+            producer=producer,
+            event_type=event_type,
+            schema_version=schema_version,
+            dlq_subject=dlq_subject,
             error_code=error_code,
             error_message=error_message,
         )
@@ -141,9 +157,11 @@ class FailedEventStore:
         with self._lock:
             total = len(self._events)
             by_status = {"pending": 0, "failed": 0, "replayed": 0}
+            by_error_code: dict[str, int] = {}
             for event in self._events.values():
                 if event.status in by_status:
                     by_status[event.status] += 1
                 else:
                     by_status[event.status] = by_status.get(event.status, 0) + 1
-        return {"total": total, "by_status": by_status}
+                by_error_code[event.error_code] = by_error_code.get(event.error_code, 0) + 1
+        return {"total": total, "by_status": by_status, "by_error_code": by_error_code}

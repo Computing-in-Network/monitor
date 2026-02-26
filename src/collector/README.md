@@ -15,6 +15,7 @@
   - 支持条件请求：`If-None-Match` 命中后返回 `304`
 - `GET /api/v1/ops/failed-events`：查看失败事件审计与状态
 - `POST /api/v1/ops/failed-events/replay`：手动重放失败事件
+  - 参数：`target=original|dlq`（默认 `original`）
 - `POST /api/v1/ingest/{kind}`：上报入口
 - `POST /api/v2/ingest/{kind}`：v2 上报入口（与 v1 并行）
   - kind 取值：`node_metric`、`node-metric`、`link_metric`、`link-metric`、`flow`、`alarm`
@@ -56,6 +57,19 @@
 - `TSDB_DSN`：Timescale 连接串
 - `TSDB_SCHEMA`：写入 schema（默认 `monitor_ts`）
 - `PRODUCER_RATE_LIMIT_RPM`：按 producer 每分钟限流阈值（`0` 表示关闭）
+
+## Topic 规范（I-031）
+- 事件主题格式：`{environment}.{domain}.{entity}.{version}`
+- 示例：`dev.raw.node_metric.v1`、`dev.raw.link_metric.v2`
+- DLQ 主题格式：`{environment}.dlq.{domain}.{entity}.{version}`
+- 示例：`dev.dlq.raw.node_metric.v1`
+
+## DLQ 与回放
+- NATS 发布失败：失败事件进入 failed-events 审计（状态 `pending`）
+- DB 写入失败：失败事件进入审计，并尝试发布到对应 DLQ 主题
+- 手动回放：
+  - `POST /api/v1/ops/failed-events/replay?target=original`
+  - `POST /api/v1/ops/failed-events/replay?target=dlq`
 
 ## Timescale 写入
 - 入站事件在发布 NATS 成功后会尝试写入 Timescale（四类表）
