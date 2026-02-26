@@ -478,18 +478,24 @@ def create_app() -> FastAPI:
             topology_epoch = str(payload.get("topology_epoch")) if payload.get("topology_epoch") not in (None, "") else None
             mode = str(payload.get("mode", "global")).strip().lower()
             if mode not in {"global", "focused", "auto"}:
-                raise HTTPException(status_code=422, detail="mode 仅支持 global|focused|auto")
+                raise HTTPException(status_code=422, detail=_analysis_error("INVALID_SCOPE", "mode 仅支持 global|focused|auto"))
             scope_type = str(payload.get("scope_type", "network")).strip().lower()
             scope_id = str(payload.get("scope_id", "all")).strip()
             if scope_type not in {"network", "node", "link"}:
-                raise HTTPException(status_code=422, detail="scope_type 仅支持 network|node|link")
+                raise HTTPException(
+                    status_code=422,
+                    detail=_analysis_error("INVALID_SCOPE", "scope_type 仅支持 network|node|link"),
+                )
 
             snapshot_payload = app.state.snapshot_store.snapshot(topology_epoch=topology_epoch)
             monitor = snapshot_payload.get("monitor", {}) if isinstance(snapshot_payload, dict) else {}
             links_map = monitor.get("links", {}) if isinstance(monitor.get("links"), dict) else {}
             links = [x for x in links_map.values() if isinstance(x, dict)]
             if not links:
-                raise HTTPException(status_code=422, detail="INSUFFICIENT_DATA: no topology links in snapshot")
+                raise HTTPException(
+                    status_code=422,
+                    detail=_analysis_error("INSUFFICIENT_DATA", "no topology links in snapshot"),
+                )
 
             alarm_scope_type = scope_type if mode == "focused" else "network"
             alarm_scope_id = scope_id if mode == "focused" else "all"
@@ -590,7 +596,10 @@ def create_app() -> FastAPI:
         try:
             mode = str(payload.get("mode", "auto")).strip().lower()
             if mode not in {"auto", "focused", "global"}:
-                raise HTTPException(status_code=422, detail="INVALID_SCOPE: mode 仅支持 auto|focused|global")
+                raise HTTPException(
+                    status_code=422,
+                    detail=_analysis_error("INVALID_SCOPE", "mode 仅支持 auto|focused|global"),
+                )
             scope_type = str(payload.get("scope_type", "network")).strip().lower()
             scope_id = str(payload.get("scope_id", "all")).strip()
 
@@ -606,7 +615,10 @@ def create_app() -> FastAPI:
                 scope_id = "all"
 
             if mode == "focused" and (scope_type not in {"node", "link"} or scope_id in {"", "all"}):
-                raise HTTPException(status_code=422, detail="INVALID_SCOPE: focused 需提供 node/link 的 scope_id")
+                raise HTTPException(
+                    status_code=422,
+                    detail=_analysis_error("INVALID_SCOPE", "focused 需提供 node/link 的 scope_id"),
+                )
 
             run_payload = {
                 "mode": mode,
@@ -622,7 +634,16 @@ def create_app() -> FastAPI:
                 "loss_warn_rate": payload.get("loss_warn_rate", 0.03),
                 "max_tasks": payload.get("max_tasks", 30),
             }
-            result = await bff_global_impact(run_payload)
+            try:
+                result = await bff_global_impact(run_payload)
+            except HTTPException as exc:
+                code, msg = _normalize_analysis_exception(exc)
+                raise HTTPException(status_code=422, detail=_analysis_error(code, msg)) from exc
+            except Exception as exc:  # noqa: BLE001
+                raise HTTPException(
+                    status_code=500,
+                    detail=_analysis_error("INTERNAL_ERROR", f"analysis run failed: {exc}"),
+                ) from exc
             out = {
                 "status": "ok",
                 "contract_version": "analysis.v1",
@@ -778,6 +799,24 @@ def _forecast_wma(values: list[float], window: int, steps: int) -> list[float]:
         out.append(float(weighted))
         hist.append(float(weighted))
     return out
+
+
+def _analysis_error(code: str, message: str) -> dict[str, str]:
+    return {"error_code": str(code), "error_message": str(message)}
+
+
+def _normalize_analysis_exception(exc: HTTPException) -> tuple[str, str]:
+    detail = exc.detail
+    if isinstance(detail, dict):
+        code = str(detail.get("error_code") or "INTERNAL_ERROR")
+        msg = str(detail.get("error_message") or detail.get("detail") or "analysis error")
+        return code, msg
+    text = str(detail or "analysis error")
+    if text.startswith("INVALID_SCOPE"):
+        return "INVALID_SCOPE", text.split(":", 1)[-1].strip() if ":" in text else text
+    if text.startswith("INSUFFICIENT_DATA"):
+        return "INSUFFICIENT_DATA", text.split(":", 1)[-1].strip() if ":" in text else text
+    return "INTERNAL_ERROR", text
 
 
 def _extract_seeds(detected_alarms: list[dict[str, Any]]) -> tuple[list[str], list[str]]:
