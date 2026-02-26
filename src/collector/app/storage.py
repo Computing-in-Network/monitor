@@ -179,23 +179,45 @@ class TimescaleWriter:
         entity_id: str,
         limit: int = 120,
         topology_epoch: str | None = None,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        bucket_sec: int | None = None,
+        agg: str = "avg",
     ) -> list[dict[str, Any]]:
         if not self.is_ready():
             raise TimescaleWriteError("timescale connection is not ready")
 
         table, id_column, metric_column = self._resolve_series_mapping(event_type=event_type, metric=metric)
         safe_limit = max(1, min(int(limit), 2000))
+        safe_bucket = None if bucket_sec is None else max(1, min(int(bucket_sec), 3600 * 24))
+        agg_sql = self._resolve_agg(agg)
 
-        sql = f"""
-        SELECT ts, {metric_column}
-        FROM {self.schema}.{table}
-        WHERE {id_column} = %s
-        """
+        if safe_bucket is None:
+            sql = f"""
+            SELECT ts, {metric_column}
+            FROM {self.schema}.{table}
+            WHERE {id_column} = %s
+            """
+        else:
+            sql = f"""
+            SELECT time_bucket(INTERVAL '{safe_bucket} second', ts) AS bucket_ts, {agg_sql}({metric_column}) AS metric_value
+            FROM {self.schema}.{table}
+            WHERE {id_column} = %s
+            """
         params: list[Any] = [entity_id]
         if topology_epoch not in (None, ""):
             sql += " AND topology_epoch = %s"
             params.append(topology_epoch)
-        sql += " ORDER BY ts DESC LIMIT %s"
+        if start is not None:
+            sql += " AND ts >= %s"
+            params.append(start)
+        if end is not None:
+            sql += " AND ts <= %s"
+            params.append(end)
+        if safe_bucket is None:
+            sql += " ORDER BY ts DESC LIMIT %s"
+        else:
+            sql += " GROUP BY bucket_ts ORDER BY bucket_ts DESC LIMIT %s"
         params.append(safe_limit)
 
         rows = self._query(sql, tuple(params))
@@ -236,3 +258,10 @@ class TimescaleWriter:
                 return list(cur.fetchall())
         except Exception as exc:  # noqa: BLE001
             raise TimescaleWriteError(str(exc)) from exc
+
+    @staticmethod
+    def _resolve_agg(agg: str) -> str:
+        val = str(agg or "avg").strip().lower()
+        if val in {"avg", "max", "min"}:
+            return val
+        raise TimescaleWriteError(f"unsupported agg={agg}, expected avg|max|min")
