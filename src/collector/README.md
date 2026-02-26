@@ -130,3 +130,12 @@
 
 ## 全局分析自测
 - `python scripts/test_global_impact_api.py`
+
+## 统一高级分析入口（I-041）
+- `POST /api/v1/bff/analysis/run`
+  - 前端轻量参数：`mode/scope_type/scope_id/topology_epoch`
+  - 后端自动执行：告警发现 -> 传播分析 -> 任务影响评估
+  - 返回：`summary/topology_impact/tasks/alerts/meta`
+
+## 统一入口自测
+- `python scripts/test_analysis_run_api.py`

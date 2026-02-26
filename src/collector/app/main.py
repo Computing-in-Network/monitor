@@ -581,6 +581,80 @@ def create_app() -> FastAPI:
         finally:
             app.state.slo.record("analysis.global_impact", ok=ok, latency_ms=(time.perf_counter() - start) * 1000.0)
 
+    @app.post("/api/v1/bff/analysis/run")
+    async def bff_analysis_run(payload: dict[str, object]) -> dict[str, object]:
+        start = time.perf_counter()
+        ok = False
+        try:
+            mode = str(payload.get("mode", "auto")).strip().lower()
+            if mode not in {"auto", "focused", "global"}:
+                raise HTTPException(status_code=422, detail="INVALID_SCOPE: mode 仅支持 auto|focused|global")
+            scope_type = str(payload.get("scope_type", "network")).strip().lower()
+            scope_id = str(payload.get("scope_id", "all")).strip()
+
+            if mode == "auto":
+                if scope_type in {"node", "link"} and scope_id not in {"", "all"}:
+                    mode = "focused"
+                else:
+                    mode = "global"
+                    scope_type = "network"
+                    scope_id = "all"
+            elif mode == "global":
+                scope_type = "network"
+                scope_id = "all"
+
+            if mode == "focused" and (scope_type not in {"node", "link"} or scope_id in {"", "all"}):
+                raise HTTPException(status_code=422, detail="INVALID_SCOPE: focused 需提供 node/link 的 scope_id")
+
+            run_payload = {
+                "mode": mode,
+                "scope_type": scope_type,
+                "scope_id": scope_id,
+                "topology_epoch": payload.get("topology_epoch"),
+                "strategies": payload.get("strategies") or ["threshold", "baseline"],
+                "window_sec": payload.get("window_sec", 300),
+                "max_depth": payload.get("max_depth", 4),
+                "spread_mode": payload.get("spread_mode", "cascade"),
+                "cascade_threshold": payload.get("cascade_threshold", 0.6),
+                "rtt_warn_ms": payload.get("rtt_warn_ms", 180.0),
+                "loss_warn_rate": payload.get("loss_warn_rate", 0.03),
+                "max_tasks": payload.get("max_tasks", 30),
+            }
+            result = await bff_global_impact(run_payload)
+            out = {
+                "status": "ok",
+                "contract_version": "analysis.v1",
+                "input": {
+                    "mode": str(payload.get("mode", "auto")).strip().lower(),
+                    "scope_type": str(payload.get("scope_type", "network")).strip().lower(),
+                    "scope_id": str(payload.get("scope_id", "all")).strip(),
+                    "topology_epoch": payload.get("topology_epoch"),
+                },
+                "resolved": {
+                    "mode": mode,
+                    "scope_type": scope_type,
+                    "scope_id": scope_id,
+                },
+                "summary": result.get("summary"),
+                "topology_impact": {
+                    "seed_nodes": (result.get("seeds") or {}).get("alarm_nodes", []),
+                    "seed_links": (result.get("seeds") or {}).get("alarm_links", []),
+                    "impacted_nodes": (result.get("impact_graph") or {}).get("impacted_nodes", []),
+                    "impacted_links": (result.get("impact_graph") or {}).get("impacted_links", []),
+                    "boundary_nodes": (result.get("impact_graph") or {}).get("boundary_nodes", []),
+                },
+                "tasks": (result.get("task_impacts") or {}).get("tasks", []),
+                "alerts": [x.get("alert_item") for x in ((result.get("task_impacts") or {}).get("tasks") or []) if isinstance(x, dict)],
+                "meta": {
+                    "detected_alarm_total": len(result.get("detected_alarms") or []),
+                    "task_total": len(((result.get("task_impacts") or {}).get("tasks") or [])),
+                },
+            }
+            ok = True
+            return out
+        finally:
+            app.state.slo.record("analysis.run", ok=ok, latency_ms=(time.perf_counter() - start) * 1000.0)
+
     @app.post("/api/v1/ops/failed-events/replay")
     async def replay_failed_events(limit: int = 50) -> dict[str, object]:
         ids = app.state.failed_events.pending_event_ids(limit=limit)
