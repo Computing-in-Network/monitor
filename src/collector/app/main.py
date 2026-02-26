@@ -7,6 +7,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 
 from .config import load_config
 from .failed_events import FailedEventStore
+from .forecast_registry import ForecastRegistry
 from .observability import OutcomeStats
 from .publisher import EventPublisher
 from .repository import IdempotentStore
@@ -34,6 +35,7 @@ def create_app() -> FastAPI:
         max_items=config.failed_events_max_items,
         audit_file_path=config.failed_events_audit_file,
     )
+    app.state.forecast_registry = ForecastRegistry(config.forecast_model_dir)
     app.state.ts_writer = None
     if config.tsdb_enabled:
         app.state.ts_writer = TimescaleWriter(config.tsdb_dsn, schema=config.tsdb_schema)
@@ -136,6 +138,9 @@ def create_app() -> FastAPI:
         horizon: int = 12,
         window: int = 12,
         history_limit: int = 240,
+        model_id: Optional[str] = None,
+        model_version: Optional[str] = None,
+        strategy: str = "auto",
     ) -> dict[str, object]:
         ts_writer = app.state.ts_writer
         if ts_writer is None or not ts_writer.is_ready():
@@ -153,12 +158,33 @@ def create_app() -> FastAPI:
         if len(points) < 4:
             raise HTTPException(status_code=422, detail="not enough points for forecast")
 
-        # Keep this endpoint deterministic and lightweight in collector:
-        # weighted moving average serves as LSTM fallback when model runtime is not attached.
         values = [float(p["value"]) for p in points]
-        safe_window = max(3, min(int(window), len(values)))
         safe_horizon = max(1, min(int(horizon), 120))
-        baseline = _forecast_wma(values=values, window=safe_window, steps=safe_horizon)
+        mode = str(strategy or "auto").strip().lower()
+        if mode not in {"auto", "registered", "fallback"}:
+            raise HTTPException(status_code=422, detail="strategy 仅支持 auto|registered|fallback")
+
+        selected = None
+        resolved_model_id = model_id or f"{event_type}.{metric}.{entity_id}"
+        if mode in {"auto", "registered"}:
+            selected = app.state.forecast_registry.resolve(resolved_model_id, version=model_version)
+            if selected is None and mode == "registered":
+                raise HTTPException(status_code=422, detail=f"model not found: {resolved_model_id}")
+
+        if selected is not None:
+            model_win = int(selected.raw.get("window") or selected.raw.get("params", {}).get("input_window") or window)
+            safe_window = max(3, min(model_win, len(values)))
+            baseline = _forecast_wma(values=values, window=safe_window, steps=safe_horizon)
+            model_type = f"lstm_{selected.backend}"
+            selected_version = selected.version
+            validation_mape = selected.validation_mape
+        else:
+            safe_window = max(3, min(int(window), len(values)))
+            baseline = _forecast_wma(values=values, window=safe_window, steps=safe_horizon)
+            model_type = "lstm_fallback_wma"
+            selected_version = "fallback"
+            validation_mape = None
+
         latest = values[-1]
         out = []
         for idx, pred in enumerate(baseline, start=1):
@@ -174,15 +200,39 @@ def create_app() -> FastAPI:
         return {
             "status": "ok",
             "source": "timescaledb",
-            "model_type": "lstm_fallback_wma",
+            "model_type": model_type,
+            "model_id": resolved_model_id,
+            "model_version": selected_version,
+            "strategy": mode,
             "event_type": event_type,
             "metric": metric,
             "entity_id": entity_id,
             "topology_epoch": topology_epoch,
             "history_points": len(values),
+            "validation_mape": validation_mape,
             "window": safe_window,
             "horizon": safe_horizon,
             "points": out,
+        }
+
+    @app.get("/api/v1/analysis/forecast/models")
+    async def list_forecast_models(model_id: Optional[str] = None) -> dict[str, object]:
+        refs = app.state.forecast_registry.list_models()
+        if model_id:
+            refs = [x for x in refs if x.model_id == model_id]
+        return {
+            "status": "ok",
+            "count": len(refs),
+            "models": [
+                {
+                    "model_id": x.model_id,
+                    "version": x.version,
+                    "backend": x.backend,
+                    "validation_mape": x.validation_mape,
+                    "file": x.file,
+                }
+                for x in refs
+            ],
         }
 
     @app.post("/api/v1/ops/failed-events/replay")

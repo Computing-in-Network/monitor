@@ -23,6 +23,7 @@ class CollectorConfig:
     tsdb_enabled: bool
     tsdb_dsn: str
     tsdb_schema: str
+    forecast_model_dir: str
 
 
 def load_config(path: str = "/app/config.example.yaml") -> CollectorConfig:
@@ -56,4 +57,5 @@ def load_config(path: str = "/app/config.example.yaml") -> CollectorConfig:
             raw.get("tsdb_dsn", "postgresql://monitor:monitor123@monitor_timescaledb:5432/monitor"),
         ),
         tsdb_schema=os.environ.get("TSDB_SCHEMA", raw.get("tsdb_schema", "monitor_ts")),
+        forecast_model_dir=os.environ.get("FORECAST_MODEL_DIR", raw.get("forecast_model_dir", "/tmp/forecast_models/lstm")),
     )
