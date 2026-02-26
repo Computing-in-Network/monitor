@@ -23,6 +23,7 @@ class CollectorConfig:
     tsdb_enabled: bool
     tsdb_dsn: str
     tsdb_schema: str
+    producer_rate_limit_rpm: int
 
 
 def load_config(path: str = "/app/config.example.yaml") -> CollectorConfig:
@@ -56,4 +57,7 @@ def load_config(path: str = "/app/config.example.yaml") -> CollectorConfig:
             raw.get("tsdb_dsn", "postgresql://monitor:monitor123@monitor_timescaledb:5432/monitor"),
         ),
         tsdb_schema=os.environ.get("TSDB_SCHEMA", raw.get("tsdb_schema", "monitor_ts")),
+        producer_rate_limit_rpm=int(
+            os.environ.get("PRODUCER_RATE_LIMIT_RPM", raw.get("producer_rate_limit_rpm", 0))
+        ),
     )
