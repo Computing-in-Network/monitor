@@ -139,3 +139,16 @@
 
 ## 统一入口自测
 - `python scripts/test_analysis_run_api.py`
+
+## 应急推演与回放（I-042）
+- `POST /api/v1/bff/simulation/create`
+  - 参数：`scenario_type(link_down|node_hotspot|regional_blackout)`、`topology_epoch`、`steps_total`、`params`
+- `POST /api/v1/bff/simulation/{simulation_id}/step`
+  - 推进一步并生成当步评估
+- `GET /api/v1/bff/simulation/{simulation_id}`
+  - 查询会话状态与完整 timeline
+- `GET /api/v1/bff/simulation/{simulation_id}/timeline`
+  - 查询推演时间线
+
+## 推演自测
+- `python scripts/test_simulation_api.py`
