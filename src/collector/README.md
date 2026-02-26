@@ -121,3 +121,12 @@
 
 ## 告警发现自测
 - `python scripts/test_alarm_discovery_api.py`
+
+## 全局传播与影响评估（I-040）
+- `POST /api/v1/bff/analysis/global-impact`
+  - 参数：`mode(global|focused|auto)`、`scope_type(network|node|link)`、`scope_id`、`topology_epoch`
+  - 行为：自动告警发现 -> 传播分析 -> 任务影响评估
+  - 返回：`summary/detected_alarms/impact_graph/task_impacts`
+
+## 全局分析自测
+- `python scripts/test_global_impact_api.py`
