@@ -6,6 +6,7 @@ from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Request, Response
 
+from .alarm_discovery import AutoAlarmDiscoverer, DiscoverRequest
 from .config import load_config
 from .failed_events import FailedEventStore
 from .fault_spread import AnalyzeRequest, SpreadAnalyzer
@@ -40,6 +41,7 @@ def create_app() -> FastAPI:
         audit_file_path=config.failed_events_audit_file,
     )
     app.state.forecast_registry = ForecastRegistry(config.forecast_model_dir)
+    app.state.alarm_discoverer = AutoAlarmDiscoverer()
     app.state.fault_spread = SpreadAnalyzer()
     app.state.task_impact = TaskImpactService()
     app.state.ts_writer = None
@@ -262,6 +264,35 @@ def create_app() -> FastAPI:
             ],
         }
 
+    @app.post("/api/v1/analysis/alarm/discover")
+    async def discover_alarms(payload: dict[str, object]) -> dict[str, object]:
+        start = time.perf_counter()
+        ok = False
+        try:
+            scope_type = str(payload.get("scope_type", "network")).strip().lower()
+            scope_id = str(payload.get("scope_id", "all")).strip()
+            if scope_type not in {"network", "node", "link"}:
+                raise HTTPException(status_code=422, detail="scope_type 仅支持 network|node|link")
+            strategies = payload.get("strategies")
+            if strategies is None:
+                strategies = ["threshold", "baseline"]
+            if not isinstance(strategies, list):
+                raise HTTPException(status_code=422, detail="strategies 必须为 list")
+            req = DiscoverRequest(
+                topology_epoch=str(payload.get("topology_epoch")) if payload.get("topology_epoch") not in (None, "") else None,
+                scope_type=scope_type,
+                scope_id=scope_id,
+                window_sec=max(60, min(int(payload.get("window_sec", 300)), 86400)),
+                strategies=[str(x) for x in strategies],
+                include_evidence_points=bool(payload.get("include_evidence_points", False)),
+            )
+            snapshot_payload = app.state.snapshot_store.snapshot(topology_epoch=req.topology_epoch)
+            result = app.state.alarm_discoverer.discover(req, snapshot_payload=snapshot_payload, ts_writer=app.state.ts_writer)
+            ok = True
+            return result
+        finally:
+            app.state.slo.record("analysis.alarm_discover", ok=ok, latency_ms=(time.perf_counter() - start) * 1000.0)
+
     @app.post("/api/v1/fault/spread")
     @app.post("/api/v1/fault/spread/analyze")
     async def fault_spread(payload: dict[str, object]) -> dict[str, object]:
@@ -432,6 +463,10 @@ def create_app() -> FastAPI:
     @app.post("/api/v1/bff/fault/task-impact")
     async def bff_fault_task_impact(payload: dict[str, object]) -> dict[str, object]:
         return await fault_task_impact(payload=payload)
+
+    @app.post("/api/v1/bff/analysis/alarm/discover")
+    async def bff_discover_alarms(payload: dict[str, object]) -> dict[str, object]:
+        return await discover_alarms(payload=payload)
 
     @app.post("/api/v1/ops/failed-events/replay")
     async def replay_failed_events(limit: int = 50) -> dict[str, object]:
