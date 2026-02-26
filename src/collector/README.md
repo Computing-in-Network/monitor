@@ -152,3 +152,8 @@
 
 ## 推演自测
 - `python scripts/test_simulation_api.py`
+
+## 前端契约冻结（I-043）
+- 契约文档：`src/collector/docs/analysis_contract_v1.md`
+- 验收脚本：`python scripts/test_frontend_contract_acceptance.py`
+  - 覆盖：`focused(node/link)`、`global(network)`、错误码 `INVALID_SCOPE`
