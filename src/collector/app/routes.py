@@ -14,12 +14,13 @@ from .contract import ContractError, validate_payload
 from .failed_events import FailedEventStore
 from .middleware.auth import validate_api_token
 from .events import build_subject, normalize_event_type
-from .mapping import normalize_payload, validate_alarm_mapping
+from .mapping import normalize_payload
 from .observability import OutcomeStats
 from .publisher import EventPublisher, PublishUnavailableError
 from .repository import IdempotentStore
 from .snapshot import MonitorSnapshotStore
 from .storage import TimescaleWriter, TimescaleWriteError
+from .uid_mapping import UidMappingService
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +59,10 @@ def _get_failed_events_store(request: Request) -> FailedEventStore:
 
 def _get_ts_writer(request: Request) -> TimescaleWriter | None:
     return request.app.state.ts_writer
+
+
+def _get_mapping_service(request: Request) -> UidMappingService:
+    return request.app.state.uid_mapping
 
 
 def _build_trace_id(request: Request) -> str:
@@ -111,6 +116,7 @@ async def ingest(
     snapshot_store: MonitorSnapshotStore = Depends(_get_snapshot_store),
     failed_events: FailedEventStore = Depends(_get_failed_events_store),
     ts_writer: TimescaleWriter | None = Depends(_get_ts_writer),
+    mapping_service: UidMappingService = Depends(_get_mapping_service),
 ):
     trace_id = _build_trace_id(request)
     event_type = _normalize_kind(kind)
@@ -152,17 +158,22 @@ async def ingest(
             trace_id=trace_id,
         )
 
-    mapping_error = validate_alarm_mapping(event_type, payload, snapshot_store)
-    if mapping_error is not None:
-        error_code, error_message = mapping_error
-        stats.record(error_code)
-        _audit(request, trace_id, error_code, event_type, message_id)
-        return _error_response(
-            status_code=422,
-            error_code=error_code,
-            error_message=error_message,
-            trace_id=trace_id,
-        )
+    if event_type == "node_metric":
+        mapping_service.upsert_node(payload.get("topology_epoch"), str(payload.get("node_uid") or payload.get("node_id") or ""))
+    elif event_type == "link_metric":
+        mapping_service.upsert_link(payload.get("topology_epoch"), str(payload.get("link_uid") or payload.get("link_id") or ""))
+    elif event_type == "alarm":
+        mapping_error = mapping_service.validate_alarm(payload)
+        if mapping_error is not None:
+            error_code, error_message = mapping_error
+            stats.record(error_code)
+            _audit(request, trace_id, error_code, event_type, message_id)
+            return _error_response(
+                status_code=422,
+                error_code=error_code,
+                error_message=error_message,
+                trace_id=trace_id,
+            )
 
     if dedup.is_duplicate(message_id):
         stats.record("DUPLICATE")

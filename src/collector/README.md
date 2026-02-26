@@ -15,6 +15,7 @@
   - 支持条件请求：`If-None-Match` 命中后返回 `304`
 - `GET /api/v1/ops/failed-events`：查看失败事件审计与状态
 - `POST /api/v1/ops/failed-events/replay`：手动重放失败事件
+- `GET /api/v1/monitor/mapping/stats`：UID 映射统计（epoch、映射失败计数、scope_uid 覆盖率）
 - `POST /api/v1/ingest/{kind}`：上报入口
   - kind 取值：`node_metric`、`node-metric`、`link_metric`、`link-metric`、`flow`、`alarm`
 - Header：
@@ -31,9 +32,19 @@
 - `INVALID_KIND`：不支持事件类型
 - `UNAUTHORIZED`：鉴权失败
 - `NATS_UNAVAILABLE`：事件总线不可用
+- `EPOCH_MAPPING_NOT_FOUND`：当前 topology_epoch 未建立映射
+- `UNKNOWN_NODE_UID`：告警 scope_uid 未命中节点映射
+- `UNKNOWN_LINK_UID`：告警 scope_uid 未命中链路映射
 
 ## 幂等策略
 - 按 `message_id` 做去重
+
+## UID 映射规则（I-032）
+- 映射按 `topology_epoch` 隔离
+- `node_metric` 会写入节点 UID 映射
+- `link_metric` 会写入链路 UID 映射
+- `alarm` 写入前必须通过映射校验（node/link）
+- `scope_uid` 覆盖率与映射失败计数可通过 `/metrics` 和 `/api/v1/monitor/mapping/stats` 观测
 
 ## 返回结构
 - success: `{"status":"ok","event_type":"node_metric","message_id":"...","trace_id":"..."}`

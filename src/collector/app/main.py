@@ -13,6 +13,7 @@ from .repository import IdempotentStore
 from .routes import router
 from .snapshot import MonitorSnapshotStore
 from .storage import TimescaleWriter
+from .uid_mapping import UidMappingService
 
 
 def create_app() -> FastAPI:
@@ -30,6 +31,7 @@ def create_app() -> FastAPI:
     app.state.idempotent = IdempotentStore(ttl_seconds=config.idempotency_ttl)
     app.state.stats = OutcomeStats()
     app.state.snapshot_store = MonitorSnapshotStore()
+    app.state.uid_mapping = UidMappingService()
     app.state.failed_events = FailedEventStore(
         max_items=config.failed_events_max_items,
         audit_file_path=config.failed_events_audit_file,
@@ -61,7 +63,17 @@ def create_app() -> FastAPI:
 
     @app.get("/metrics")
     async def metrics() -> dict[str, object]:
-        return app.state.stats.snapshot()
+        return {
+            **app.state.stats.snapshot(),
+            "uid_mapping": app.state.uid_mapping.stats(),
+        }
+
+    @app.get("/api/v1/monitor/mapping/stats")
+    async def mapping_stats() -> dict[str, object]:
+        return {
+            "status": "ok",
+            "mapping": app.state.uid_mapping.stats(),
+        }
 
     @app.get("/api/v1/monitor/snapshot")
     async def monitor_snapshot(
