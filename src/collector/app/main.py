@@ -7,6 +7,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 
 from .config import load_config
 from .failed_events import FailedEventStore
+from .fault_spread import AnalyzeRequest, SpreadAnalyzer
+from .fault_task_impact import TaskImpactRequest, TaskImpactService
 from .forecast_registry import ForecastRegistry
 from .observability import OutcomeStats
 from .publisher import EventPublisher
@@ -36,6 +38,8 @@ def create_app() -> FastAPI:
         audit_file_path=config.failed_events_audit_file,
     )
     app.state.forecast_registry = ForecastRegistry(config.forecast_model_dir)
+    app.state.fault_spread = SpreadAnalyzer()
+    app.state.task_impact = TaskImpactService()
     app.state.ts_writer = None
     if config.tsdb_enabled:
         app.state.ts_writer = TimescaleWriter(config.tsdb_dsn, schema=config.tsdb_schema)
@@ -234,6 +238,43 @@ def create_app() -> FastAPI:
                 for x in refs
             ],
         }
+
+    @app.post("/api/v1/fault/spread")
+    @app.post("/api/v1/fault/spread/analyze")
+    async def fault_spread(payload: dict[str, object]) -> dict[str, object]:
+        alarm_nodes = payload.get("alarm_nodes")
+        links = payload.get("links")
+        if not isinstance(alarm_nodes, list) or not isinstance(links, list):
+            raise HTTPException(status_code=422, detail="alarm_nodes(list) 与 links(list) 为必填")
+        mode = str(payload.get("mode", "single_point"))
+        if mode not in {"single_point", "cascade"}:
+            raise HTTPException(status_code=422, detail="mode 仅支持 single_point|cascade")
+        req = AnalyzeRequest(
+            alarm_nodes=[str(x) for x in alarm_nodes],
+            links=[x for x in links if isinstance(x, dict)],
+            max_depth=max(1, min(int(payload.get("max_depth", 3)), 8)),
+            mode=mode,
+            cascade_threshold=float(payload.get("cascade_threshold", 0.6)),
+        )
+        result = app.state.fault_spread.analyze(req)
+        return {"status": "ok", "result": result}
+
+    @app.post("/api/v1/fault/task-impact")
+    @app.post("/api/v1/fault/task-impact/evaluate")
+    async def fault_task_impact(payload: dict[str, object]) -> dict[str, object]:
+        tasks = payload.get("tasks")
+        link_metrics = payload.get("link_metrics")
+        if not isinstance(tasks, list) or not isinstance(link_metrics, dict):
+            raise HTTPException(status_code=422, detail="tasks(list) 与 link_metrics(dict) 为必填")
+        req = TaskImpactRequest(
+            tasks=[x for x in tasks if isinstance(x, dict)],
+            link_metrics={str(k): v for k, v in link_metrics.items() if isinstance(v, dict)},
+            fault_spread=payload.get("fault_spread") if isinstance(payload.get("fault_spread"), dict) else None,
+            rtt_warn_ms=float(payload.get("rtt_warn_ms", 180.0)),
+            loss_warn_rate=float(payload.get("loss_warn_rate", 0.03)),
+        )
+        result = app.state.task_impact.evaluate(req)
+        return {"status": "ok", "result": result}
 
     @app.post("/api/v1/ops/failed-events/replay")
     async def replay_failed_events(limit: int = 50) -> dict[str, object]:

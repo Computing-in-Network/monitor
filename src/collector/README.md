@@ -71,3 +71,21 @@
     - `model_type/model_id/model_version/strategy`
     - `validation_mape`（有训练模型时）
     - `points` 预测点
+
+## 故障追踪服务（I-035）
+- `POST /api/v1/fault/spread`
+- `POST /api/v1/fault/spread/analyze`（兼容路径）
+  - 必填：`alarm_nodes(list)`、`links(list)`
+  - 可选：`mode(single_point|cascade)`、`max_depth`、`cascade_threshold`
+  - 返回：`impacted_nodes/impacted_links/subgraph/paths`
+- `POST /api/v1/fault/task-impact`
+- `POST /api/v1/fault/task-impact/evaluate`（兼容路径）
+  - 必填：`tasks(list)`、`link_metrics(dict)`
+  - 可选：`fault_spread`、`rtt_warn_ms`、`loss_warn_rate`
+  - 返回：`tasks/work_orders/impacted_link_count`
+
+## 故障 API 自测
+- 先安装依赖（Python 3.10）：
+  - `uv venv --python /usr/bin/python3.10 .venv310 && source .venv310/bin/activate && uv pip install -r requirements.txt httpx`
+- 运行：
+  - `python scripts/test_fault_api.py`
