@@ -16,6 +16,7 @@ from .forecast_registry import ForecastRegistry
 from .observability import ApiSLOTracker, OutcomeStats
 from .publisher import EventPublisher
 from .repository import IdempotentStore
+from .realtime_alarm import RealtimeAlarmEngine
 from .routes import router
 from .simulation import SimulationManager
 from .snapshot import MonitorSnapshotStore
@@ -46,6 +47,7 @@ def create_app() -> FastAPI:
     app.state.alarm_discoverer = AutoAlarmDiscoverer()
     app.state.fault_spread = SpreadAnalyzer()
     app.state.task_impact = TaskImpactService()
+    app.state.realtime_alarm = RealtimeAlarmEngine()
     app.state.simulations = SimulationManager()
     app.state.fault_bridge = FaultInjectionBridge()
     app.state.ts_writer = None
@@ -132,6 +134,34 @@ def create_app() -> FastAPI:
                 app.state.snapshot_store.apply("alarm", event)
                 if app.state.ts_writer is not None and app.state.ts_writer.is_ready():
                     app.state.ts_writer.write_event("alarm", event)
+        for wrapped in mapped.get("metrics_upsert", []):
+            if not isinstance(wrapped, dict):
+                continue
+            event_type = str(wrapped.get("event_type") or "").strip()
+            payload = wrapped.get("payload") if isinstance(wrapped.get("payload"), dict) else None
+            if event_type not in {"node_metric", "link_metric"} or payload is None:
+                continue
+            app.state.snapshot_store.apply(event_type, payload)
+            if app.state.ts_writer is not None and app.state.ts_writer.is_ready():
+                app.state.ts_writer.write_event(event_type, payload)
+            for alarm in app.state.realtime_alarm.evaluate_metric(event_type, payload):
+                app.state.snapshot_store.apply("alarm", alarm)
+                if app.state.ts_writer is not None and app.state.ts_writer.is_ready():
+                    app.state.ts_writer.write_event("alarm", alarm)
+        for wrapped in mapped.get("metrics_recover", []):
+            if not isinstance(wrapped, dict):
+                continue
+            event_type = str(wrapped.get("event_type") or "").strip()
+            payload = wrapped.get("payload") if isinstance(wrapped.get("payload"), dict) else None
+            if event_type not in {"node_metric", "link_metric"} or payload is None:
+                continue
+            app.state.snapshot_store.apply(event_type, payload)
+            if app.state.ts_writer is not None and app.state.ts_writer.is_ready():
+                app.state.ts_writer.write_event(event_type, payload)
+            for alarm in app.state.realtime_alarm.evaluate_metric(event_type, payload):
+                app.state.snapshot_store.apply("alarm", alarm)
+                if app.state.ts_writer is not None and app.state.ts_writer.is_ready():
+                    app.state.ts_writer.write_event("alarm", alarm)
         return mapped
 
     @app.get("/api/v1/monitor/series")
@@ -722,6 +752,17 @@ def create_app() -> FastAPI:
                     "task_total": len(((result.get("task_impacts") or {}).get("tasks") or [])),
                 },
             }
+            out["clusters"] = _build_fault_clusters(
+                seeds=out.get("topology_impact", {}),
+                impact_graph=result.get("impact_graph") if isinstance(result.get("impact_graph"), dict) else {},
+            )
+            out["narrative"] = _build_analysis_narrative(
+                resolved=out.get("resolved", {}),
+                summary=out.get("summary", {}),
+                topology_impact=out.get("topology_impact", {}),
+                top_task_id=(out.get("tasks") or [{}])[0].get("task_id") if isinstance(out.get("tasks"), list) and out.get("tasks") else None,
+                clusters=out.get("clusters", []),
+            )
             ok = True
             return out
         finally:
@@ -1076,6 +1117,137 @@ def _global_summary(
         "task_degraded": degraded,
         "average_priority_score": avg_priority,
     }
+
+
+def _build_analysis_narrative(
+    *,
+    resolved: dict[str, Any],
+    summary: dict[str, Any],
+    topology_impact: dict[str, Any],
+    top_task_id: str | None,
+    clusters: list[dict[str, Any]],
+) -> dict[str, Any]:
+    mode = str((resolved or {}).get("mode") or "-")
+    scope_type = str((resolved or {}).get("scope_type") or "-")
+    scope_id = str((resolved or {}).get("scope_id") or "-")
+    risk = str((summary or {}).get("risk_level") or "unknown")
+    impacted_nodes = len((topology_impact or {}).get("impacted_nodes") or [])
+    impacted_links = len((topology_impact or {}).get("impacted_links") or [])
+    task_total = int((summary or {}).get("task_total") or 0)
+    avg_score = float((summary or {}).get("average_priority_score") or 0.0)
+
+    if risk == "critical":
+        verdict = "高风险，建议立即处置"
+        action = "优先处理断链/中断任务，并执行链路切换或降载。"
+    elif risk == "warning":
+        verdict = "中风险，建议尽快干预"
+        action = "优先排查高分任务链路，确认是否存在持续抖动或丢包升高。"
+    else:
+        verdict = "低风险，可持续观察"
+        action = "保持监控，重点跟踪分数最高任务是否继续上升。"
+
+    sentence = (
+        f"本次为 {mode} 模式，聚焦对象 {scope_type}/{scope_id}。"
+        f"当前风险等级为 {risk}，影响节点 {impacted_nodes} 个、影响链路 {impacted_links} 条，"
+        f"共评估任务 {task_total} 个，平均优先级 {avg_score:.2f}。"
+    )
+    primary_faults = []
+    for item in (clusters or [])[:3]:
+        if not isinstance(item, dict):
+            continue
+        primary_faults.append(
+            {
+                "cluster_id": item.get("cluster_id"),
+                "seed_nodes": item.get("seed_nodes", []),
+                "seed_links": item.get("seed_links", []),
+                "impacted_nodes": item.get("impacted_nodes_count", 0),
+                "impacted_links": item.get("impacted_links_count", 0),
+                "contribution": item.get("contribution_ratio", 0.0),
+            }
+        )
+    return {
+        "verdict": verdict,
+        "summary_sentence": sentence,
+        "next_action": action,
+        "top_task_id": top_task_id or "-",
+        "primary_faults": primary_faults,
+    }
+
+
+def _build_fault_clusters(seeds: dict[str, Any], impact_graph: dict[str, Any]) -> list[dict[str, Any]]:
+    seed_nodes = [str(x) for x in (seeds.get("seed_nodes") or []) if str(x).strip()]
+    seed_links = [str(x) for x in (seeds.get("seed_links") or []) if str(x).strip()]
+    subgraph = impact_graph.get("subgraph") if isinstance(impact_graph, dict) else {}
+    edges = subgraph.get("edges") if isinstance(subgraph, dict) else []
+    if not isinstance(edges, list) or not edges:
+        return [
+            {
+                "cluster_id": "cluster-1",
+                "seed_nodes": seed_nodes,
+                "seed_links": seed_links,
+                "impacted_nodes_count": len(set(seed_nodes)),
+                "impacted_links_count": len(set(seed_links)),
+                "contribution_ratio": 1.0 if seed_nodes or seed_links else 0.0,
+            }
+        ] if (seed_nodes or seed_links) else []
+
+    graph: dict[str, set[str]] = {}
+    edge_uids: set[str] = set()
+    for e in edges:
+        if not isinstance(e, dict):
+            continue
+        src = str(e.get("src") or "").strip()
+        dst = str(e.get("dst") or "").strip()
+        if not src or not dst:
+            continue
+        graph.setdefault(src, set()).add(dst)
+        graph.setdefault(dst, set()).add(src)
+        edge_uids.add(normalize_link_uid(src, dst))
+
+    unvisited = set(graph.keys())
+    comps: list[set[str]] = []
+    while unvisited:
+        root = unvisited.pop()
+        stack = [root]
+        comp = {root}
+        while stack:
+            cur = stack.pop()
+            for nxt in graph.get(cur, set()):
+                if nxt in comp:
+                    continue
+                comp.add(nxt)
+                if nxt in unvisited:
+                    unvisited.remove(nxt)
+                stack.append(nxt)
+        comps.append(comp)
+
+    total_nodes = max(1, sum(len(c) for c in comps))
+    out: list[dict[str, Any]] = []
+    for idx, comp in enumerate(sorted(comps, key=lambda c: -len(c)), start=1):
+        comp_links = []
+        for uid in edge_uids:
+            a, b = uid.split("<->", 1)
+            if a in comp and b in comp:
+                comp_links.append(uid)
+        comp_seed_nodes = [x for x in seed_nodes if x in comp]
+        comp_seed_links = []
+        for lk in seed_links:
+            if "<->" not in lk:
+                continue
+            a, b = lk.split("<->", 1)
+            if a in comp and b in comp:
+                comp_seed_links.append(lk)
+        out.append(
+            {
+                "cluster_id": f"cluster-{idx}",
+                "seed_nodes": comp_seed_nodes,
+                "seed_links": comp_seed_links,
+                "impacted_nodes_count": len(comp),
+                "impacted_links_count": len(comp_links),
+                "contribution_ratio": round(len(comp) / total_nodes, 4),
+            }
+        )
+    return out
 
 
 def _safe_float(v: Any) -> float:

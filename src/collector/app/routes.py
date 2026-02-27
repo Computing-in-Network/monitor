@@ -18,6 +18,7 @@ from .mapping import normalize_payload, validate_alarm_mapping
 from .observability import OutcomeStats
 from .publisher import EventPublisher, PublishUnavailableError
 from .repository import IdempotentStore
+from .realtime_alarm import RealtimeAlarmEngine
 from .snapshot import MonitorSnapshotStore
 from .storage import TimescaleWriter, TimescaleWriteError
 
@@ -58,6 +59,10 @@ def _get_failed_events_store(request: Request) -> FailedEventStore:
 
 def _get_ts_writer(request: Request) -> TimescaleWriter | None:
     return request.app.state.ts_writer
+
+
+def _get_realtime_alarm(request: Request) -> RealtimeAlarmEngine:
+    return request.app.state.realtime_alarm
 
 
 def _build_trace_id(request: Request) -> str:
@@ -111,6 +116,7 @@ async def ingest(
     snapshot_store: MonitorSnapshotStore = Depends(_get_snapshot_store),
     failed_events: FailedEventStore = Depends(_get_failed_events_store),
     ts_writer: TimescaleWriter | None = Depends(_get_ts_writer),
+    realtime_alarm: RealtimeAlarmEngine = Depends(_get_realtime_alarm),
 ):
     trace_id = _build_trace_id(request)
     event_type = _normalize_kind(kind)
@@ -220,6 +226,21 @@ async def ingest(
                 error_code="DB_WRITE_FAILED",
                 error_message=str(e),
             )
+    for alarm_payload in realtime_alarm.evaluate_metric(event_type, payload):
+        snapshot_store.apply("alarm", alarm_payload)
+        if ts_writer is not None:
+            try:
+                await asyncio.to_thread(ts_writer.write_event, "alarm", alarm_payload)
+            except TimescaleWriteError as e:
+                stats.record("DB_WRITE_FAILED")
+                _audit(request, trace_id, "DB_WRITE_FAILED", "alarm", str(alarm_payload.get("message_id") or ""))
+                failed_events.record(
+                    trace_id=trace_id,
+                    subject="timescale.write",
+                    payload={"event_type": "alarm", "payload": alarm_payload},
+                    error_code="DB_WRITE_FAILED",
+                    error_message=str(e),
+                )
     stats.record("OK")
     _audit(request, trace_id, "OK", event_type, message_id)
     return {

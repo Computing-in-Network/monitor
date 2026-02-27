@@ -111,7 +111,17 @@ async def run() -> None:
 
         snap1 = await client.get("/api/v1/bff/snapshot?topology_epoch=1708848000")
         assert snap1.status_code == 200, snap1.text
-        assert snap1.json().get("monitor", {}).get("alarm_summary", {}).get("total") == 1
+        alarms1 = snap1.json().get("monitor", {}).get("alarms", [])
+        assert isinstance(alarms1, list)
+        assert len(alarms1) >= 1
+        assert any(str(a.get("alarm_id")) == "FI-fault-001" for a in alarms1 if isinstance(a, dict))
+        node_after_inject = (
+            snap1.json()
+            .get("monitor", {})
+            .get("nodes", {})
+            .get("SAT-POLAR-001", {})
+        )
+        assert str(node_after_inject.get("status")) == "DOWN"
 
         after = await client.post(
             "/api/v1/bff/analysis/run",
@@ -139,6 +149,13 @@ async def run() -> None:
         snap2 = await client.get("/api/v1/bff/snapshot?topology_epoch=1708848000")
         assert snap2.status_code == 200, snap2.text
         assert snap2.json().get("monitor", {}).get("alarm_summary", {}).get("total") == 0
+        node_after_clear = (
+            snap2.json()
+            .get("monitor", {})
+            .get("nodes", {})
+            .get("SAT-POLAR-001", {})
+        )
+        assert str(node_after_clear.get("status")) == "UP"
 
         after_clear = await client.post(
             "/api/v1/bff/analysis/run",
@@ -147,6 +164,38 @@ async def run() -> None:
         assert after_clear.status_code == 200, after_clear.text
         impacted_after_clear = after_clear.json().get("topology_impact", {}).get("impacted_nodes", [])
         assert len(impacted_after_clear) == 0
+
+        # Clear fallback path: ack doesn't echo fault_id, only returns current faults[].
+        inject2 = await client.post(
+            "/api/v1/ops/fault-injection/control-ack",
+            json={
+                "type": "control_ack",
+                "ok": True,
+                "action": "inject_link_fault",
+                "request_id": "req-3",
+                "topology_epoch": "1708848000",
+                "fault": {
+                    "fault_id": "fault-002",
+                    "fault_type": "INTERRUPTED",
+                    "target": {"a": "SAT-POLAR-001", "b": "SAT-POLAR-002"},
+                    "created_at": "2026-02-26T12:01:00Z",
+                },
+            },
+        )
+        assert inject2.status_code == 200, inject2.text
+        clear2 = await client.post(
+            "/api/v1/ops/fault-injection/control-ack",
+            json={
+                "type": "control_ack",
+                "ok": True,
+                "action": "clear_fault",
+                "request_id": "req-4",
+                "topology_epoch": "1708848000",
+                "faults": [],
+            },
+        )
+        assert clear2.status_code == 200, clear2.text
+        assert len(clear2.json().get("alarms_recover", [])) >= 1
 
     print("fault_injection_loop_test_ok")
 
