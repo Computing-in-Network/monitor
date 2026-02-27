@@ -86,14 +86,16 @@ class SimulationManager:
             nodes=nodes,
             links=links,
         )
+        spread_links = _normalize_links_for_spread([x for x in links.values() if isinstance(x, dict)])
 
         fake_snapshot = {"monitor": {"nodes": nodes, "links": links, "alarms": [], "topology_epoch": session.topology_epoch}}
+        discover_strategies = ["threshold"] if session.scenario_type in {"link_down", "node_hotspot"} else ["threshold", "baseline"]
         discovered = alarm_discoverer.discover(
             DiscoverRequest(
                 topology_epoch=session.topology_epoch,
                 scope_type="network",
                 scope_id="all",
-                strategies=["threshold", "baseline"],
+                strategies=discover_strategies,
             ),
             snapshot_payload=fake_snapshot,
             ts_writer=ts_writer,
@@ -123,9 +125,9 @@ class SimulationManager:
         spread = spread_analyzer.analyze(
             AnalyzeRequest(
                 alarm_nodes=seeds_node,
-                links=[x for x in links.values() if isinstance(x, dict)],
-                max_depth=4,
-                mode="cascade",
+                links=spread_links,
+                max_depth=2 if session.scenario_type in {"link_down", "node_hotspot"} else 4,
+                mode="single_point" if session.scenario_type in {"link_down", "node_hotspot"} else "cascade",
                 cascade_threshold=0.6,
             )
         )
@@ -187,16 +189,33 @@ class SimulationManager:
         severity = max(0.2, min(1.0, step_no / max(1, steps_total)))
         if scenario_type == "link_down":
             target = str(params.get("link_id") or params.get("scope_id") or "").strip()
+            matched = False
             for uid, lk in links.items():
                 if not isinstance(lk, dict):
                     continue
                 lid = str(lk.get("link_uid") or lk.get("link_id") or uid)
                 if lid != target:
                     continue
+                matched = True
                 lk["state"] = "DOWN" if severity > 0.4 else "DEGRADED"
                 lk["loss_rate"] = round(max(float(lk.get("loss_rate") or 0.0), 0.05 * severity), 4)
                 lk["rtt_ms"] = round(max(float(lk.get("rtt_ms") or 0.0), 180 + 260 * severity), 2)
                 lk["jitter_ms"] = round(max(float(lk.get("jitter_ms") or 0.0), 12 + 20 * severity), 2)
+            if (not matched) and "<->" in target:
+                a, b = [x.strip() for x in target.split("<->", 1)]
+                if a and b:
+                    links[target] = {
+                        "link_uid": target,
+                        "link_id": target,
+                        "src_node_uid": a,
+                        "src_node_id": a,
+                        "dst_node_uid": b,
+                        "dst_node_id": b,
+                        "state": "DOWN" if severity > 0.4 else "DEGRADED",
+                        "loss_rate": round(0.05 * severity, 4),
+                        "rtt_ms": round(180 + 260 * severity, 2),
+                        "jitter_ms": round(12 + 20 * severity, 2),
+                    }
             return
 
         if scenario_type == "node_hotspot":
@@ -289,3 +308,28 @@ def _f(v: Any) -> float:
         return float(v)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _normalize_links_for_spread(links: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for item in links:
+        if not isinstance(item, dict):
+            continue
+        src = str(item.get("src") or item.get("src_node_uid") or item.get("src_node_id") or "").strip()
+        dst = str(item.get("dst") or item.get("dst_node_uid") or item.get("dst_node_id") or "").strip()
+        uid = str(item.get("link_uid") or item.get("link_id") or "").strip()
+        if not uid and src and dst:
+            uid = "<->".join(sorted([src, dst]))
+        if not src or not dst:
+            continue
+        out.append(
+            {
+                **item,
+                "src": src,
+                "dst": dst,
+                "link_uid": uid,
+                "link_id": uid or str(item.get("link_id") or ""),
+                "health": float(item.get("health") or 0.8),
+            }
+        )
+    return out

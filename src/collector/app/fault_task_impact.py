@@ -133,7 +133,7 @@ class TaskImpactService:
         down_ratio = (down_count / total_links) if total_links > 0 else 0.0
         if total_links == 0:
             status = "normal"
-        elif down_ratio >= 0.5 or impacted_ratio >= 0.8:
+        elif down_ratio >= 0.5 or (impacted_ratio >= 0.8 and down_count > 0):
             status = "disconnected"
         elif impacted_count > 0:
             status = "degraded"

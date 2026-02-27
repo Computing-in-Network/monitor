@@ -9,6 +9,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from .alarm_discovery import AutoAlarmDiscoverer, DiscoverRequest
 from .config import load_config
 from .failed_events import FailedEventStore
+from .fault_injection import FaultInjectionBridge, normalize_link_uid
 from .fault_spread import AnalyzeRequest, SpreadAnalyzer
 from .fault_task_impact import TaskImpactRequest, TaskImpactService
 from .forecast_registry import ForecastRegistry
@@ -46,6 +47,7 @@ def create_app() -> FastAPI:
     app.state.fault_spread = SpreadAnalyzer()
     app.state.task_impact = TaskImpactService()
     app.state.simulations = SimulationManager()
+    app.state.fault_bridge = FaultInjectionBridge()
     app.state.ts_writer = None
     if config.tsdb_enabled:
         app.state.ts_writer = TimescaleWriter(config.tsdb_dsn, schema=config.tsdb_schema)
@@ -113,6 +115,24 @@ def create_app() -> FastAPI:
             "summary": app.state.failed_events.summary(),
             "items": app.state.failed_events.list_events(limit=limit, status=status),
         }
+
+    @app.post("/api/v1/ops/fault-injection/control-ack")
+    async def ingest_fault_control_ack(payload: dict[str, object]) -> dict[str, object]:
+        if str(payload.get("type") or "").strip() != "control_ack":
+            raise HTTPException(status_code=422, detail="payload.type 必须为 control_ack")
+        topology_epoch = str(payload.get("topology_epoch")) if payload.get("topology_epoch") not in (None, "") else None
+        mapped = app.state.fault_bridge.map_control_ack(ack=payload, topology_epoch=topology_epoch)
+        for event in mapped.get("alarms_upsert", []):
+            if isinstance(event, dict):
+                app.state.snapshot_store.apply("alarm", event)
+                if app.state.ts_writer is not None and app.state.ts_writer.is_ready():
+                    app.state.ts_writer.write_event("alarm", event)
+        for event in mapped.get("alarms_recover", []):
+            if isinstance(event, dict):
+                app.state.snapshot_store.apply("alarm", event)
+                if app.state.ts_writer is not None and app.state.ts_writer.is_ready():
+                    app.state.ts_writer.write_event("alarm", event)
+        return mapped
 
     @app.get("/api/v1/monitor/series")
     async def monitor_series(
@@ -182,7 +202,25 @@ def create_app() -> FastAPI:
             except Exception as exc:  # noqa: BLE001
                 raise HTTPException(status_code=422, detail=str(exc)) from exc
             if len(points) < 4:
-                raise HTTPException(status_code=422, detail="not enough points for forecast")
+                ok = True
+                return {
+                    "status": "ok",
+                    "source": "timescaledb",
+                    "model_type": "lstm_no_data",
+                    "model_id": model_id or f"{event_type}.{metric}.{entity_id}",
+                    "model_version": "n/a",
+                    "strategy": str(strategy or "auto").strip().lower(),
+                    "event_type": event_type,
+                    "metric": metric,
+                    "entity_id": entity_id,
+                    "topology_epoch": topology_epoch,
+                    "history_points": len(points),
+                    "validation_mape": None,
+                    "window": max(3, min(int(window), 120)),
+                    "horizon": max(1, min(int(horizon), 120)),
+                    "points": [],
+                    "note": "not enough points for forecast",
+                }
 
             values = [float(p["value"]) for p in points]
             safe_horizon = max(1, min(int(horizon), 120))
@@ -310,7 +348,7 @@ def create_app() -> FastAPI:
                 raise HTTPException(status_code=422, detail="mode 仅支持 single_point|cascade")
             req = AnalyzeRequest(
                 alarm_nodes=[str(x) for x in alarm_nodes],
-                links=[x for x in links if isinstance(x, dict)],
+                links=_normalize_links_for_spread([x for x in links if isinstance(x, dict)]),
                 max_depth=max(1, min(int(payload.get("max_depth", 3)), 8)),
                 mode=mode,
                 cascade_threshold=float(payload.get("cascade_threshold", 0.6)),
@@ -480,7 +518,11 @@ def create_app() -> FastAPI:
             if mode not in {"global", "focused", "auto"}:
                 raise HTTPException(status_code=422, detail=_analysis_error("INVALID_SCOPE", "mode 仅支持 global|focused|auto"))
             scope_type = str(payload.get("scope_type", "network")).strip().lower()
-            scope_id = str(payload.get("scope_id", "all")).strip()
+            scope_id = _resolve_scope_id(payload)
+            if scope_type not in {"network", "node", "link"}:
+                scope_type = _infer_scope_type(scope_id=scope_id, fallback="network")
+            if scope_type == "link":
+                scope_id = _normalize_link_scope(scope_id)
             if scope_type not in {"network", "node", "link"}:
                 raise HTTPException(
                     status_code=422,
@@ -491,7 +533,9 @@ def create_app() -> FastAPI:
             monitor = snapshot_payload.get("monitor", {}) if isinstance(snapshot_payload, dict) else {}
             links_map = monitor.get("links", {}) if isinstance(monitor.get("links"), dict) else {}
             links = [x for x in links_map.values() if isinstance(x, dict)]
-            if not links:
+            links = _merge_payload_links(links=links, payload_links=payload.get("links"))
+            spread_links = _normalize_links_for_spread(links)
+            if not spread_links:
                 raise HTTPException(
                     status_code=422,
                     detail=_analysis_error("INSUFFICIENT_DATA", "no topology links in snapshot"),
@@ -533,12 +577,12 @@ def create_app() -> FastAPI:
 
             alarm_nodes = list(seed_nodes)
             if not alarm_nodes and seed_links:
-                for lk in links:
+                for lk in spread_links:
                     uid = str(lk.get("link_uid") or lk.get("link_id") or "")
                     if uid not in seed_links:
                         continue
-                    src = str(lk.get("src_node_uid") or lk.get("src_node_id") or "")
-                    dst = str(lk.get("dst_node_uid") or lk.get("dst_node_id") or "")
+                    src = str(lk.get("src") or lk.get("src_node_uid") or lk.get("src_node_id") or "")
+                    dst = str(lk.get("dst") or lk.get("dst_node_uid") or lk.get("dst_node_id") or "")
                     if src and src not in alarm_nodes:
                         alarm_nodes.append(src)
                     if dst and dst not in alarm_nodes:
@@ -546,7 +590,7 @@ def create_app() -> FastAPI:
 
             spread_req = AnalyzeRequest(
                 alarm_nodes=alarm_nodes,
-                links=links,
+                links=spread_links,
                 max_depth=max(1, min(int(payload.get("max_depth", 4)), 10)),
                 mode=str(payload.get("spread_mode", "cascade")),
                 cascade_threshold=float(payload.get("cascade_threshold", 0.6)),
@@ -554,6 +598,7 @@ def create_app() -> FastAPI:
             spread_result = app.state.fault_spread.analyze(spread_req)
 
             link_metrics = _extract_link_metrics(links_map)
+            link_metrics.update(_extract_payload_link_metrics(payload.get("link_metrics")))
             tasks = [x for x in (payload.get("tasks") or []) if isinstance(x, dict)]
             if not tasks:
                 tasks = _build_global_tasks(link_metrics, max_tasks=max(10, min(int(payload.get("max_tasks", 30)), 100)))
@@ -601,7 +646,11 @@ def create_app() -> FastAPI:
                     detail=_analysis_error("INVALID_SCOPE", "mode 仅支持 auto|focused|global"),
                 )
             scope_type = str(payload.get("scope_type", "network")).strip().lower()
-            scope_id = str(payload.get("scope_id", "all")).strip()
+            scope_id = _resolve_scope_id(payload)
+            if scope_type not in {"network", "node", "link"}:
+                scope_type = _infer_scope_type(scope_id=scope_id, fallback="network")
+            if scope_type == "link":
+                scope_id = _normalize_link_scope(scope_id)
 
             if mode == "auto":
                 if scope_type in {"node", "link"} and scope_id not in {"", "all"}:
@@ -625,7 +674,7 @@ def create_app() -> FastAPI:
                 "scope_type": scope_type,
                 "scope_id": scope_id,
                 "topology_epoch": payload.get("topology_epoch"),
-                "strategies": payload.get("strategies") or ["threshold", "baseline"],
+                "strategies": payload.get("strategies") or (["threshold"] if mode == "focused" else ["threshold", "baseline"]),
                 "window_sec": payload.get("window_sec", 300),
                 "max_depth": payload.get("max_depth", 4),
                 "spread_mode": payload.get("spread_mode", "cascade"),
@@ -650,7 +699,7 @@ def create_app() -> FastAPI:
                 "input": {
                     "mode": str(payload.get("mode", "auto")).strip().lower(),
                     "scope_type": str(payload.get("scope_type", "network")).strip().lower(),
-                    "scope_id": str(payload.get("scope_id", "all")).strip(),
+                    "scope_id": _resolve_scope_id(payload),
                     "topology_epoch": payload.get("topology_epoch"),
                 },
                 "resolved": {
@@ -805,6 +854,43 @@ def _analysis_error(code: str, message: str) -> dict[str, str]:
     return {"error_code": str(code), "error_message": str(message)}
 
 
+def _resolve_scope_id(payload: dict[str, Any]) -> str:
+    direct = str(payload.get("scope_id", "")).strip()
+    if direct and direct != "all":
+        return direct
+    alias = str(payload.get("entity", "") or payload.get("entity_id", "")).strip()
+    if alias:
+        return alias
+    src = str(payload.get("source", "") or payload.get("src", "") or payload.get("a", "")).strip()
+    dst = str(payload.get("target", "") or payload.get("dst", "") or payload.get("b", "")).strip()
+    if src and dst:
+        return normalize_link_uid(src, dst)
+    return str(payload.get("scope_id", "all")).strip() or "all"
+
+
+def _infer_scope_type(scope_id: str, fallback: str = "network") -> str:
+    sid = str(scope_id or "").strip()
+    if "<->" in sid or "->" in sid or "|" in sid:
+        return "link"
+    if sid and sid != "all":
+        return "node"
+    return fallback
+
+
+def _normalize_link_scope(scope_id: str) -> str:
+    sid = str(scope_id or "").strip()
+    if "<->" in sid:
+        parts = [x.strip() for x in sid.split("<->", 1)]
+        return normalize_link_uid(parts[0], parts[1]) if len(parts) == 2 else sid
+    if "->" in sid:
+        parts = [x.strip() for x in sid.split("->", 1)]
+        return normalize_link_uid(parts[0], parts[1]) if len(parts) == 2 else sid
+    if "|" in sid:
+        parts = [x.strip() for x in sid.split("|", 1)]
+        return normalize_link_uid(parts[0], parts[1]) if len(parts) == 2 else sid
+    return sid
+
+
 def _normalize_analysis_exception(exc: HTTPException) -> tuple[str, str]:
     detail = exc.detail
     if isinstance(detail, dict):
@@ -847,6 +933,85 @@ def _extract_link_metrics(links_map: dict[str, Any]) -> dict[str, dict[str, Any]
             "rtt_ms": raw.get("rtt_ms"),
             "loss_rate": raw.get("loss_rate"),
         }
+    return out
+
+
+def _extract_payload_link_metrics(raw: Any) -> dict[str, dict[str, Any]]:
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for uid, item in raw.items():
+        if not isinstance(item, dict):
+            continue
+        key = _normalize_link_scope(str(uid or "").strip())
+        if not key:
+            continue
+        out[key] = {
+            "state": item.get("state"),
+            "rtt_ms": item.get("rtt_ms"),
+            "loss_rate": item.get("loss_rate"),
+        }
+    return out
+
+
+def _merge_payload_links(links: list[dict[str, Any]], payload_links: Any) -> list[dict[str, Any]]:
+    out = [x for x in links if isinstance(x, dict)]
+    seen = {
+        _normalize_link_scope(str(x.get("link_uid") or x.get("link_id") or "").strip())
+        for x in out
+        if isinstance(x, dict)
+    }
+    extra = payload_links if isinstance(payload_links, list) else []
+    for item in extra:
+        if not isinstance(item, dict):
+            continue
+        src = str(item.get("src") or item.get("src_node_uid") or item.get("src_node_id") or "").strip()
+        dst = str(item.get("dst") or item.get("dst_node_uid") or item.get("dst_node_id") or "").strip()
+        uid = _normalize_link_scope(str(item.get("link_uid") or item.get("link_id") or ""))
+        if not uid and src and dst:
+            uid = normalize_link_uid(src, dst)
+        if not uid or uid in seen:
+            continue
+        seen.add(uid)
+        out.append(
+            {
+                "link_uid": uid,
+                "link_id": uid,
+                "src_node_uid": src,
+                "src_node_id": src,
+                "dst_node_uid": dst,
+                "dst_node_id": dst,
+                "state": item.get("state", "UP"),
+                "rtt_ms": item.get("rtt_ms", 0.0),
+                "loss_rate": item.get("loss_rate", 0.0),
+                "jitter_ms": item.get("jitter_ms", 0.0),
+            }
+        )
+    return out
+
+
+def _normalize_links_for_spread(links: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for item in links:
+        if not isinstance(item, dict):
+            continue
+        src = str(item.get("src") or item.get("src_node_uid") or item.get("src_node_id") or "").strip()
+        dst = str(item.get("dst") or item.get("dst_node_uid") or item.get("dst_node_id") or "").strip()
+        uid = _normalize_link_scope(str(item.get("link_uid") or item.get("link_id") or ""))
+        if not uid and src and dst:
+            uid = normalize_link_uid(src, dst)
+        if not src or not dst:
+            continue
+        out.append(
+            {
+                **item,
+                "src": src,
+                "dst": dst,
+                "link_uid": uid,
+                "link_id": uid or str(item.get("link_id") or ""),
+                "health": float(item.get("health") or 0.8),
+            }
+        )
     return out
 
 

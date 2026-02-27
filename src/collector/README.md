@@ -15,6 +15,7 @@
   - 支持条件请求：`If-None-Match` 命中后返回 `304`
 - `GET /api/v1/ops/failed-events`：查看失败事件审计与状态
 - `POST /api/v1/ops/failed-events/replay`：手动重放失败事件
+- `POST /api/v1/ops/fault-injection/control-ack`：接收 dynamic-topo 故障注入回执并映射为 alarm
 - `GET /api/v1/analysis/forecast/models`：查询已注册预测模型列表
 - `GET /api/v1/analysis/forecast/lstm`：预测查询（支持注册模型优先，fallback 兜底）
 - `POST /api/v1/ingest/{kind}`：上报入口
@@ -157,3 +158,8 @@
 - 契约文档：`src/collector/docs/analysis_contract_v1.md`
 - 验收脚本：`python scripts/test_frontend_contract_acceptance.py`
   - 覆盖：`focused(node/link)`、`global(network)`、错误码 `INVALID_SCOPE`
+
+## 故障注入闭环桥接（I-044）
+- 桥接文档：`src/collector/docs/fault_injection_bridge_v1.md`
+- 接口：`POST /api/v1/ops/fault-injection/control-ack`
+- 闭环自测：`python scripts/test_fault_injection_loop.py`

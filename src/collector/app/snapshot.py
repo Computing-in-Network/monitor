@@ -88,7 +88,11 @@ class MonitorSnapshotStore:
             if event_type == "alarm":
                 alarm_id = str(payload.get("alarm_id") or "")
                 if alarm_id:
-                    snap.alarms[alarm_id] = dict(payload)
+                    lifecycle = str(payload.get("lifecycle_state") or "").strip().lower()
+                    if lifecycle in {"recovered", "closed", "cleared"}:
+                        snap.alarms.pop(alarm_id, None)
+                    else:
+                        snap.alarms[alarm_id] = dict(payload)
                     snap.snapshot_version += 1
                     snap.updated_at = datetime.now(timezone.utc)
 
