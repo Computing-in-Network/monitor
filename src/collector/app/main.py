@@ -1061,13 +1061,60 @@ def create_app() -> FastAPI:
         session = app.state.simulations.get(simulation_id)
         if session is None:
             raise HTTPException(status_code=404, detail=f"simulation not found: {simulation_id}")
+        timeline_rows = session.timeline
+        key_events = _extract_simulation_key_events(timeline_rows)
         return {
             "status": "ok",
             "simulation_id": session.simulation_id,
             "scenario_type": session.scenario_type,
             "current_step": session.current_step,
             "steps_total": session.steps_total,
-            "timeline": session.timeline,
+            "timeline": timeline_rows,
+            "key_events": key_events,
+            "summary": _simulation_timeline_summary(timeline_rows),
+        }
+
+    @app.post("/api/v1/bff/simulation/{simulation_id}/report")
+    async def simulation_report(simulation_id: str, payload: dict[str, object] | None = None) -> dict[str, object]:
+        session = app.state.simulations.get(simulation_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail=f"simulation not found: {simulation_id}")
+        payload = payload or {}
+        provider = str(payload.get("provider") or os.getenv("AI_PROVIDER") or "newapi").strip().lower()
+        if provider not in {"newapi", "gemini", "ollama"}:
+            provider = "newapi"
+        model = str(
+            payload.get("model")
+            or (os.getenv("OLLAMA_MODEL") if provider == "ollama" else os.getenv("AI_MODEL_NAME") or os.getenv("GEMINI_MODEL"))
+            or ("qwen3-coder:latest" if provider == "ollama" else "qwen3-coder:latest")
+        ).strip() or ("qwen3-coder:latest" if provider == "ollama" else "qwen3-coder:latest")
+
+        summary = _simulation_timeline_summary(session.timeline)
+        key_events = _extract_simulation_key_events(session.timeline)
+        prompt = _build_simulation_report_prompt(
+            simulation_id=session.simulation_id,
+            scenario_type=session.scenario_type,
+            focus_scope=session.params,
+            timeline_summary=summary,
+            key_events=key_events,
+            timeline_tail=session.timeline[-8:],
+        )
+        if provider == "ollama":
+            text, used_url, err, used_model = _ollama_generate(prompt=prompt, model=model)
+        else:
+            text, used_url, err, used_model = _newapi_generate(prompt=prompt, model=model)
+        if not text:
+            raise HTTPException(status_code=504, detail=_analysis_error("AI_UNAVAILABLE", err or f"{provider} unavailable"))
+        return {
+            "status": "ok",
+            "simulation_id": session.simulation_id,
+            "scenario_type": session.scenario_type,
+            "model": used_model,
+            "source": provider,
+            "base_url": used_url,
+            "summary": summary,
+            "key_events": key_events,
+            "report_markdown": text,
         }
 
     @app.post("/api/v1/ops/failed-events/replay")
@@ -2472,6 +2519,89 @@ def _forecast_confidence_level(*, validation_mape: float | None, est_mape: float
     if m <= 0.25:
         return "medium"
     return "low"
+
+
+def _simulation_timeline_summary(timeline: list[dict[str, Any]]) -> dict[str, Any]:
+    if not timeline:
+        return {
+            "steps": 0,
+            "risk_peak": "normal",
+            "max_impacted_nodes": 0,
+            "max_impacted_links": 0,
+            "max_alarm_total": 0,
+        }
+    risk_peak = "normal"
+    max_nodes = 0
+    max_links = 0
+    max_alarm = 0
+    for item in timeline:
+        if not isinstance(item, dict):
+            continue
+        risk = str(((item.get("summary") or {}).get("risk_level")) or "normal")
+        if _severity_rank(risk) > _severity_rank(risk_peak):
+            risk_peak = risk
+        max_nodes = max(max_nodes, int(item.get("impacted_nodes") or 0))
+        max_links = max(max_links, int(item.get("impacted_links") or 0))
+        max_alarm = max(max_alarm, int(item.get("detected_alarm_total") or 0))
+    return {
+        "steps": len(timeline),
+        "risk_peak": risk_peak,
+        "max_impacted_nodes": max_nodes,
+        "max_impacted_links": max_links,
+        "max_alarm_total": max_alarm,
+    }
+
+
+def _extract_simulation_key_events(timeline: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for item in timeline:
+        if not isinstance(item, dict):
+            continue
+        step = int(item.get("step") or 0)
+        risk = str(((item.get("summary") or {}).get("risk_level")) or "normal")
+        delta = item.get("delta") if isinstance(item.get("delta"), dict) else {}
+        d_nodes = int(delta.get("impacted_nodes") or 0)
+        d_links = int(delta.get("impacted_links") or 0)
+        d_alarms = int(delta.get("detected_alarm_total") or 0)
+        if risk == "critical" or d_nodes > 8 or d_links > 20 or d_alarms > 5:
+            out.append(
+                {
+                    "step": step,
+                    "risk_level": risk,
+                    "delta": {"impacted_nodes": d_nodes, "impacted_links": d_links, "detected_alarm_total": d_alarms},
+                    "direct_reason": str(item.get("direct_reason") or ""),
+                    "next_action": str(item.get("next_action") or ""),
+                }
+            )
+    return out[:12]
+
+
+def _build_simulation_report_prompt(
+    *,
+    simulation_id: str,
+    scenario_type: str,
+    focus_scope: dict[str, Any],
+    timeline_summary: dict[str, Any],
+    key_events: list[dict[str, Any]],
+    timeline_tail: list[dict[str, Any]],
+) -> str:
+    compact = {
+        "simulation_id": simulation_id,
+        "scenario_type": scenario_type,
+        "focus_scope": focus_scope,
+        "timeline_summary": timeline_summary,
+        "key_events": key_events,
+        "timeline_tail": timeline_tail,
+    }
+    return (
+        "你是网络故障演练复盘专家，请输出一份 Markdown 复盘报告。\n"
+        "要求：\n"
+        "1) 包含“场景摘要、关键拐点、处置动作评估、改进建议、后续演练建议”五个章节；\n"
+        "2) 必须引用输入中的 step 与指标变化，不要编造；\n"
+        "3) 关键拐点至少列出 3 条；\n"
+        "4) 输出中文，简洁但信息完整。\n"
+        f"\n输入：\n{json.dumps(compact, ensure_ascii=False)}\n"
+    )
 
 
 def _safe_float(v: Any) -> float:

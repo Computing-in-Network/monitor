@@ -463,6 +463,8 @@ export function App() {
   const [analysisSupported, setAnalysisSupported] = useState(true);
   const [simulationLoading, setSimulationLoading] = useState(false);
   const [simulationResult, setSimulationResult] = useState(null);
+  const [simulationReport, setSimulationReport] = useState(null);
+  const [simulationReportLoading, setSimulationReportLoading] = useState(false);
   const [analysisSummary, setAnalysisSummary] = useState(null);
   const [analysisDirectReason, setAnalysisDirectReason] = useState('');
   const [analysisAiReport, setAnalysisAiReport] = useState('');
@@ -1365,6 +1367,7 @@ export function App() {
         first,
         timeline: Array.isArray(timeline) ? timeline.slice(-5) : []
       });
+      setSimulationReport(null);
       const msg = `推演完成：${simulationId}，timeline=${Array.isArray(timeline) ? timeline.length : 0}`;
       setMonitorActionStatus(msg);
       pushToast(msg, 'ok');
@@ -1374,6 +1377,34 @@ export function App() {
       pushToast(msg, 'warn');
     } finally {
       setSimulationLoading(false);
+    }
+  }
+
+  async function generateSimulationReport() {
+    if (!monitorClientRef.current || !simulationResult?.simulationId) {
+      const msg = '请先运行推演再生成复盘报告';
+      setMonitorActionStatus(msg);
+      pushToast(msg, 'warn');
+      return;
+    }
+    try {
+      setSimulationReportLoading(true);
+      const resp = await monitorClientRef.current.createSimulationReport(simulationResult.simulationId, {});
+      setSimulationReport({
+        simulationId: resp?.simulation_id || simulationResult.simulationId,
+        model: resp?.model || '',
+        source: resp?.source || '',
+        summary: resp?.summary || {},
+        keyEvents: Array.isArray(resp?.key_events) ? resp.key_events : [],
+        markdown: String(resp?.report_markdown || '').trim()
+      });
+      pushToast('复盘报告已生成', 'ok');
+    } catch (err) {
+      const msg = err?.message || '生成复盘报告失败';
+      setMonitorActionStatus(msg);
+      pushToast(msg, 'warn');
+    } finally {
+      setSimulationReportLoading(false);
     }
   }
 
@@ -2853,6 +2884,7 @@ export function App() {
                 <span>推演</span>
                 <div className="monitor-header-actions">
                   <button type="button" onClick={runSimulationFlow} disabled={simulationLoading}>{simulationLoading ? '推演中...' : '运行推演'}</button>
+                  <button type="button" onClick={generateSimulationReport} disabled={simulationReportLoading || !simulationResult?.simulationId}>{simulationReportLoading ? '报告生成中...' : '生成复盘报告'}</button>
                 </div>
               </div>
               {simulationResult ? (
@@ -2874,6 +2906,15 @@ export function App() {
                   ) : null}
                 </div>
               ) : <div className="fault-empty">尚未运行推演</div>}
+              {simulationReport ? (
+                <div className="analysis-block">
+                  <div><strong>复盘报告</strong>{simulationReport.model ? ` (${simulationReport.model})` : ''}</div>
+                  <div>simulation: {simulationReport.simulationId}</div>
+                  <div>risk_peak: {simulationReport.summary?.risk_peak || '-'}, max_nodes: {simulationReport.summary?.max_impacted_nodes ?? '-'}, max_links: {simulationReport.summary?.max_impacted_links ?? '-'}</div>
+                  <div>key_events: {simulationReport.keyEvents?.length ?? 0}</div>
+                  <div className="analysis-ai-report">{simulationReport.markdown || '暂无复盘正文'}</div>
+                </div>
+              ) : null}
             </div>
           ) : null}
         </div>
