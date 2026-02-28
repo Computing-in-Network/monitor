@@ -1001,17 +1001,36 @@ def create_app() -> FastAPI:
                 str(x) for x in (primary_finding.get("evidence") or [])
                 if str(x).strip()
             ]
+            scope_observation = payload.get("scope_observation") if isinstance(payload.get("scope_observation"), dict) else {}
+            obs_severity = _infer_scope_severity_from_observation(scope_type, scope_observation)
+            obs_evidence = _observation_evidence(scope_type=scope_type, observation=scope_observation)
+            alarm_total = int((out.get("summary") or {}).get("detected_alarm_total") or 0)
+            has_structured_finding = bool(findings)
+            if alarm_total > 0 or has_structured_finding:
+                decision = "confirmed_fault"
+            elif _severity_rank(obs_severity) >= _severity_rank("warning"):
+                decision = "suspected_anomaly"
+            else:
+                decision = "normal"
+            risk_level = str((out.get("summary") or {}).get("risk_level") or "normal").strip().lower() or "normal"
+            if decision == "normal":
+                risk_level = "normal"
+            elif risk_level == "normal" and _severity_rank(obs_severity) >= _severity_rank("warning"):
+                risk_level = obs_severity
             out["risk_result"] = {
                 "source": "rules_lstm",
-                "risk_level": (out.get("summary") or {}).get("risk_level"),
+                "risk_level": risk_level,
                 "max_alarm_severity": (out.get("summary") or {}).get("max_alarm_severity"),
                 "focused_scope_severity": (out.get("summary") or {}).get("focused_scope_severity"),
                 "detected_alarm_total": (out.get("summary") or {}).get("detected_alarm_total"),
-                "direct_reason": "、".join(primary_evidence[:3]) if primary_evidence else None,
+                "decision": decision,
+                "direct_reason": "、".join(primary_evidence[:3]) if primary_evidence else ("、".join(obs_evidence[:3]) if obs_evidence else None),
                 "primary_finding": primary_finding or None,
             }
             out["evidence_bundle"] = {
-                "scope_observation": payload.get("scope_observation") if isinstance(payload.get("scope_observation"), dict) else {},
+                "scope_observation": scope_observation,
+                "scope_observation_severity": obs_severity,
+                "scope_observation_evidence": obs_evidence,
                 "top_findings": findings,
                 "detected_alarms": [
                     x for x in (result.get("detected_alarms") or [])
@@ -2185,6 +2204,48 @@ def _infer_scope_severity_from_observation(scope_type: str, observation: dict[st
     return "info"
 
 
+def _observation_evidence(*, scope_type: str, observation: dict[str, Any]) -> list[str]:
+    st = str(scope_type or "").strip().lower()
+    if not isinstance(observation, dict):
+        return []
+    if st == "node":
+        cpu = _safe_float(observation.get("cpu_ratio"))
+        mem = _safe_float(observation.get("mem_ratio"))
+        status = str(observation.get("status") or "").strip().upper()
+        out: list[str] = []
+        if cpu >= 0.92:
+            out.append(f"cpu_ratio={cpu:.3f}>=0.92")
+        elif cpu >= 0.82:
+            out.append(f"cpu_ratio={cpu:.3f}>=0.82")
+        if mem >= 0.92:
+            out.append(f"mem_ratio={mem:.3f}>=0.92")
+        elif mem >= 0.82:
+            out.append(f"mem_ratio={mem:.3f}>=0.82")
+        if status and status != "UP":
+            out.append(f"status={status}")
+        return out
+    if st == "link":
+        loss = _safe_float(observation.get("loss_rate"))
+        rtt = _safe_float(observation.get("rtt_ms"))
+        jitter = _safe_float(observation.get("jitter_ms"))
+        state = str(observation.get("state") or "").strip().upper()
+        out = []
+        if loss >= 0.06:
+            out.append(f"loss_rate={loss:.3f}>=0.06")
+        elif loss >= 0.03:
+            out.append(f"loss_rate={loss:.3f}>=0.03")
+        if rtt >= 280:
+            out.append(f"rtt_ms={rtt:.1f}>=280")
+        elif rtt >= 180:
+            out.append(f"rtt_ms={rtt:.1f}>=180")
+        if jitter >= 35:
+            out.append(f"jitter_ms={jitter:.1f}>=35")
+        if state in {"DOWN", "DISCONNECTED", "DEGRADED"}:
+            out.append(f"state={state}")
+        return out
+    return []
+
+
 def _shortest_path_nodes(graph: dict[str, set[str]], src: str, dst: str) -> list[str]:
     if src == dst:
         return [src]
@@ -2871,6 +2932,8 @@ def _build_mapping_suggestion_prompt(
 def _build_copilot_prompt(*, analysis: dict[str, Any], question: str, history: list[Any]) -> str:
     compact = {
         "resolved": analysis.get("resolved"),
+        "risk_result": analysis.get("risk_result"),
+        "evidence_bundle": analysis.get("evidence_bundle"),
         "summary": analysis.get("summary"),
         "topology_impact": analysis.get("topology_impact"),
         "reasoning": analysis.get("reasoning"),
@@ -2892,10 +2955,12 @@ def _build_copilot_prompt(*, analysis: dict[str, Any], question: str, history: l
 
 
 def _copilot_references(*, analysis: dict[str, Any]) -> list[dict[str, Any]]:
+    rr = analysis.get("risk_result") if isinstance(analysis.get("risk_result"), dict) else {}
     summary = analysis.get("summary") if isinstance(analysis.get("summary"), dict) else {}
     topo = analysis.get("topology_impact") if isinstance(analysis.get("topology_impact"), dict) else {}
     refs: list[dict[str, Any]] = [
-        {"type": "summary", "key": "risk_level", "value": str(summary.get("risk_level") or "-")},
+        {"type": "summary", "key": "risk_level", "value": str(rr.get("risk_level") or summary.get("risk_level") or "-")},
+        {"type": "summary", "key": "decision", "value": str(rr.get("decision") or "-")},
         {"type": "summary", "key": "detected_alarm_total", "value": int(summary.get("detected_alarm_total") or 0)},
         {"type": "impact", "key": "impacted_nodes", "value": len(topo.get("impacted_nodes") or [])},
         {"type": "impact", "key": "impacted_links", "value": len(topo.get("impacted_links") or [])},

@@ -1284,13 +1284,20 @@ export function App() {
 
   async function askCopilot() {
     const q = String(copilotQuestion || '').trim();
-    if (!q || !taskImpact || !monitorClientRef.current) {
+    if (!q || !monitorClientRef.current) {
+      return;
+    }
+    const analysisPayload = taskImpact || analysisOverview;
+    if (!analysisPayload) {
+      const msg = '请先点击“运行分析”再追问';
+      setMonitorActionStatus(msg);
+      pushToast(msg, 'warn');
       return;
     }
     try {
       setCopilotLoading(true);
       const resp = await monitorClientRef.current.analysisCopilot({
-        analysis: taskImpact,
+        analysis: analysisPayload,
         session_id: copilotSessionId || undefined,
         question: q,
         history: copilotHistory.map((x) => ({ q: x.q, a: x.a }))
@@ -2359,6 +2366,16 @@ export function App() {
   const ruleRiskResult = (taskImpact && typeof taskImpact.risk_result === 'object') ? taskImpact.risk_result : null;
   const evidenceBundle = (taskImpact && typeof taskImpact.evidence_bundle === 'object') ? taskImpact.evidence_bundle : null;
   const displayRiskLevel = String(ruleRiskResult?.risk_level || taskImpact?.summary?.risk_level || taskImpact?.risk_level || '-');
+  const displayDecision = String(ruleRiskResult?.decision || 'unknown');
+  const displayDecisionText = (
+    displayDecision === 'confirmed_fault'
+      ? '已确认故障'
+      : displayDecision === 'suspected_anomaly'
+        ? '疑似异常（待确认）'
+        : displayDecision === 'normal'
+          ? '当前正常'
+          : '-'
+  );
   const displayDirectReason = String(ruleRiskResult?.direct_reason || directReasonText || '').trim();
   const evidenceFindings = Array.isArray(evidenceBundle?.top_findings) ? evidenceBundle.top_findings : [];
   const evidenceAlarms = Array.isArray(evidenceBundle?.detected_alarms) ? evidenceBundle.detected_alarms : [];
@@ -2877,6 +2894,7 @@ export function App() {
                     </div>
                     <div className="analysis-block">
                       <div><strong>风险预警（规则/LSTM）</strong></div>
+                      <div>故障判定: {displayDecisionText}</div>
                       <div>risk: {displayRiskLevel}</div>
                       <div>source: {ruleRiskResult?.source || 'rules_lstm'}</div>
                       <div>max_severity: {ruleRiskResult?.max_alarm_severity || taskImpact?.summary?.max_alarm_severity || '-'}</div>
@@ -2890,6 +2908,8 @@ export function App() {
                       <div>impacted_links: {evidenceBundle?.impacted_links_count ?? (faultSpread?.impacted_links?.length ?? 0)}</div>
                       <div>top_findings: {evidenceFindings.length}</div>
                       <div>detected_alarms: {evidenceAlarms.length}</div>
+                      <div>observation_severity: {evidenceBundle?.scope_observation_severity || '-'}</div>
+                      <div>observation_evidence: {Array.isArray(evidenceBundle?.scope_observation_evidence) && evidenceBundle.scope_observation_evidence.length > 0 ? evidenceBundle.scope_observation_evidence.join(' | ') : '-'}</div>
                       <div>tasks_top: {evidenceTasks.length}</div>
                       <div>route_mode: {taskImpact?.topology_impact?.route_mode || '-'}, policy: {taskImpact?.topology_impact?.policy || '-'}</div>
                       <div>security_level: {evidenceBundle?.security_correlation?.level || taskImpact?.security_correlation?.level || 'none'}</div>
