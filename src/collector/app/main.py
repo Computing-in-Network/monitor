@@ -890,6 +890,11 @@ def create_app() -> FastAPI:
                     "impacted_links": (result.get("impact_graph") or {}).get("impacted_links", []),
                     "boundary_nodes": (result.get("impact_graph") or {}).get("boundary_nodes", []),
                     "policy": (result.get("impact_graph") or {}).get("policy"),
+                    "route_mode": (
+                        "route_first"
+                        if str((result.get("impact_graph") or {}).get("policy") or "") == "route_terminal_paths"
+                        else "topology_fallback"
+                    ),
                     "matched_flows": (result.get("impact_graph") or {}).get("matched_flows"),
                 },
                 "tasks": (result.get("task_impacts") or {}).get("tasks", []),
@@ -899,6 +904,26 @@ def create_app() -> FastAPI:
                     "task_total": len(((result.get("task_impacts") or {}).get("tasks") or [])),
                 },
             }
+            snapshot_payload = app.state.snapshot_store.snapshot(topology_epoch=payload.get("topology_epoch"))
+            monitor = snapshot_payload.get("monitor", {}) if isinstance(snapshot_payload, dict) else {}
+            all_link_ids = sorted(
+                {
+                    _normalize_link_scope(str(x.get("link_uid") or x.get("link_id") or ""))
+                    for x in (monitor.get("links", {}) or {}).values()
+                    if isinstance(x, dict)
+                }
+            )
+            impacted_link_ids = [
+                _normalize_link_scope(str(x))
+                for x in (out.get("topology_impact", {}).get("impacted_links") or [])
+                if str(x).strip()
+            ]
+            impacted_set = set(impacted_link_ids)
+            out["topology_impact"]["filtered_out"] = [x for x in all_link_ids if x and x not in impacted_set][:80]
+            out["topology_impact"]["rank_top"] = _build_route_rank_top(
+                tasks=out.get("tasks") if isinstance(out.get("tasks"), list) else [],
+                impacted_links=impacted_link_ids,
+            )
             out["clusters"] = _build_fault_clusters(
                 seeds=out.get("topology_impact", {}),
                 impact_graph=result.get("impact_graph") if isinstance(result.get("impact_graph"), dict) else {},
@@ -916,7 +941,6 @@ def create_app() -> FastAPI:
                 detected_alarms=result.get("detected_alarms") if isinstance(result.get("detected_alarms"), list) else [],
                 topology_impact=out.get("topology_impact", {}),
             )
-            snapshot_payload = app.state.snapshot_store.snapshot(topology_epoch=payload.get("topology_epoch"))
             out["security_correlation"] = _build_security_correlation(
                 resolved=out.get("resolved", {}),
                 detected_alarms=result.get("detected_alarms") if isinstance(result.get("detected_alarms"), list) else [],
@@ -2379,6 +2403,27 @@ def _build_security_correlation(
         "evidence": evidence,
         "suspected_path": suspected_path,
     }
+
+
+def _build_route_rank_top(*, tasks: list[dict[str, Any]], impacted_links: list[str]) -> list[dict[str, Any]]:
+    scores: dict[str, float] = {}
+    impacted_set = {str(x) for x in impacted_links if str(x).strip()}
+    for t in tasks:
+        if not isinstance(t, dict):
+            continue
+        task_score = float(t.get("priority_score") or 0.0)
+        status = str(t.get("status") or "")
+        bonus = 15.0 if status == "disconnected" else 8.0 if status in {"degraded", "latency_anomaly"} else 0.0
+        links = [str(x) for x in (t.get("impacted_links") or []) if str(x).strip()]
+        for lk in links:
+            lk_norm = _normalize_link_scope(lk)
+            if impacted_set and lk_norm not in impacted_set:
+                continue
+            scores[lk_norm] = max(scores.get(lk_norm, 0.0), task_score + bonus)
+    if not scores:
+        return [{"link_id": x, "score": 0.0, "reason": "route_impact"} for x in impacted_links[:12]]
+    ranked = sorted(scores.items(), key=lambda x: (-x[1], x[0]))[:12]
+    return [{"link_id": k, "score": round(v, 2), "reason": "task_priority"} for k, v in ranked]
 
 
 def _parse_any_timestamp(ts: Any) -> float | None:
