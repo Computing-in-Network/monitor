@@ -251,6 +251,8 @@ def create_app() -> FastAPI:
                     "topology_epoch": topology_epoch,
                     "history_points": len(points),
                     "validation_mape": None,
+                    "metrics": {"mape": None, "rmse": None},
+                    "confidence": {"level": "unknown", "reason": "insufficient_history"},
                     "window": max(3, min(int(window), 120)),
                     "horizon": max(1, min(int(horizon), 120)),
                     "points": [],
@@ -298,6 +300,8 @@ def create_app() -> FastAPI:
                         "upper": round(pred + spread, 6),
                     }
                 )
+            est_mape, est_rmse = _estimate_forecast_error(values=values, window=safe_window)
+            confidence = _forecast_confidence_level(validation_mape=validation_mape, est_mape=est_mape)
             ok = True
             return {
                 "status": "ok",
@@ -312,6 +316,8 @@ def create_app() -> FastAPI:
                 "topology_epoch": topology_epoch,
                 "history_points": len(values),
                 "validation_mape": validation_mape,
+                "metrics": {"mape": est_mape, "rmse": est_rmse},
+                "confidence": {"level": confidence, "reason": "validation_mape_first"},
                 "window": safe_window,
                 "horizon": safe_horizon,
                 "points": out,
@@ -1238,6 +1244,7 @@ def _build_ollama_analysis_prompt(
     tasks = analysis.get("tasks") if isinstance(analysis.get("tasks"), list) else []
     extra_obj = extra_context if isinstance(extra_context, dict) else {}
     obs = extra_obj.get("scope_observation") if isinstance(extra_obj.get("scope_observation"), dict) else {}
+    fc = extra_obj.get("forecast_context") if isinstance(extra_obj.get("forecast_context"), dict) else {}
     impacted_nodes = topo.get("impacted_nodes") if isinstance(topo.get("impacted_nodes"), list) else []
     impacted_links = topo.get("impacted_links") if isinstance(topo.get("impacted_links"), list) else []
     findings_all = [x for x in (reasoning.get("top_findings") or []) if isinstance(x, dict)]
@@ -1258,6 +1265,7 @@ def _build_ollama_analysis_prompt(
         "next_action": narrative.get("next_action"),
         "tasks_top10": tasks[:10],
         "scope_observation": obs,
+        "forecast_context": fc,
         "direct_reason_hint": extra_obj.get("direct_reason"),
         "extra_context": extra_obj,
     }
@@ -2385,6 +2393,40 @@ def _parse_any_timestamp(ts: Any) -> float | None:
         return datetime.fromisoformat(raw).timestamp()
     except ValueError:
         return None
+
+
+def _estimate_forecast_error(*, values: list[float], window: int) -> tuple[float | None, float | None]:
+    if len(values) < max(6, window + 2):
+        return None, None
+    preds: list[float] = []
+    actuals: list[float] = []
+    for i in range(window, len(values)):
+        hist = values[:i]
+        pred = _forecast_wma(values=hist, window=min(window, len(hist)), steps=1)[0]
+        preds.append(float(pred))
+        actuals.append(float(values[i]))
+    if not preds:
+        return None, None
+    ape: list[float] = []
+    se_sum = 0.0
+    for p, a in zip(preds, actuals):
+        if abs(a) > 1e-9:
+            ape.append(abs((a - p) / a))
+        se_sum += (a - p) ** 2
+    mape = round(sum(ape) / len(ape), 6) if ape else None
+    rmse = round((se_sum / len(preds)) ** 0.5, 6)
+    return mape, rmse
+
+
+def _forecast_confidence_level(*, validation_mape: float | None, est_mape: float | None) -> str:
+    m = validation_mape if isinstance(validation_mape, (int, float)) else est_mape
+    if m is None:
+        return "unknown"
+    if m <= 0.12:
+        return "high"
+    if m <= 0.25:
+        return "medium"
+    return "low"
 
 
 def _safe_float(v: Any) -> float:

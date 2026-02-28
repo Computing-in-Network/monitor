@@ -1160,44 +1160,7 @@ export function App() {
       setFaultSpread(spreadResult);
       setTaskImpact(impactResult);
       setAnalysisOverview(overviewResult);
-      const aiSeq = aiExplainSeqRef.current + 1;
-      aiExplainSeqRef.current = aiSeq;
-      setAnalysisAiLoading(true);
-      monitorClientRef.current.analyzeExplain({
-        analysis: overviewResult,
-        scope_type: scopeType,
-        scope_id: scopeId,
-        extra_context: {
-          direct_reason: directReasonFromMetrics || '',
-          scope_observation: scopeObservation || {},
-          security_correlation: overviewResult?.security_correlation || {},
-          impacted_nodes: spreadResult?.impacted_nodes || [],
-          impacted_links: spreadResult?.impacted_links || [],
-          tasks_top: Array.isArray(impactResult?.tasks) ? impactResult.tasks.slice(0, 8) : []
-        }
-      }).then((explainResp) => {
-        if (aiExplainSeqRef.current !== aiSeq) {
-          return;
-        }
-        setAnalysisAiReport(String(explainResp?.report || '').trim());
-        setAnalysisAiMeta({
-          source: explainResp?.source || 'unknown',
-          model: explainResp?.model || '',
-          fallbackReason: explainResp?.fallback_reason || ''
-        });
-      }).catch((explainErr) => {
-        if (aiExplainSeqRef.current !== aiSeq) {
-          return;
-        }
-        setAnalysisAiError(explainErr?.message || 'AI报告生成失败');
-        setAnalysisAiMeta(null);
-        setAnalysisAiReport('');
-      }).finally(() => {
-        if (aiExplainSeqRef.current !== aiSeq) {
-          return;
-        }
-        setAnalysisAiLoading(false);
-      });
+      let forecastContext = {};
       if (scopeType === 'node' || scopeType === 'link') {
         try {
           const eventType = scopeType === 'link' ? 'link_metric' : 'node_metric';
@@ -1229,16 +1192,69 @@ export function App() {
               }))
               .filter((p) => Number.isFinite(p.v))
             : [];
+          forecastContext = {
+            model_type: forecastResp?.model_type || '',
+            model_version: forecastResp?.model_version || '',
+            metrics: forecastResp?.metrics || {},
+            confidence: forecastResp?.confidence || {},
+            horizon: forecastResp?.horizon,
+            window: forecastResp?.window,
+            points: points.slice(0, 24)
+          };
           setSeriesSnapshot({
             eventType,
             metric,
             entityId: scopeId,
-            points
+            points,
+            modelType: forecastResp?.model_type || '',
+            modelVersion: forecastResp?.model_version || '',
+            metrics: forecastResp?.metrics || {},
+            confidence: forecastResp?.confidence || {}
           });
         } catch {
           setSeriesSnapshot(null);
+          forecastContext = {};
         }
       }
+      const aiSeq = aiExplainSeqRef.current + 1;
+      aiExplainSeqRef.current = aiSeq;
+      setAnalysisAiLoading(true);
+      monitorClientRef.current.analyzeExplain({
+        analysis: overviewResult,
+        scope_type: scopeType,
+        scope_id: scopeId,
+        extra_context: {
+          direct_reason: directReasonFromMetrics || '',
+          scope_observation: scopeObservation || {},
+          forecast_context: forecastContext,
+          security_correlation: overviewResult?.security_correlation || {},
+          impacted_nodes: spreadResult?.impacted_nodes || [],
+          impacted_links: spreadResult?.impacted_links || [],
+          tasks_top: Array.isArray(impactResult?.tasks) ? impactResult.tasks.slice(0, 8) : []
+        }
+      }).then((explainResp) => {
+        if (aiExplainSeqRef.current !== aiSeq) {
+          return;
+        }
+        setAnalysisAiReport(String(explainResp?.report || '').trim());
+        setAnalysisAiMeta({
+          source: explainResp?.source || 'unknown',
+          model: explainResp?.model || '',
+          fallbackReason: explainResp?.fallback_reason || ''
+        });
+      }).catch((explainErr) => {
+        if (aiExplainSeqRef.current !== aiSeq) {
+          return;
+        }
+        setAnalysisAiError(explainErr?.message || 'AI报告生成失败');
+        setAnalysisAiMeta(null);
+        setAnalysisAiReport('');
+      }).finally(() => {
+        if (aiExplainSeqRef.current !== aiSeq) {
+          return;
+        }
+        setAnalysisAiLoading(false);
+      });
       const impactedNodeCount = Array.isArray(spreadResult?.impacted_nodes) ? spreadResult.impacted_nodes.length : 0;
       const impactedLinkCount = Array.isArray(spreadResult?.impacted_links) ? spreadResult.impacted_links.length : 0;
       setMonitorActionStatus(`已刷新高级分析结果（高亮节点 ${impactedNodeCount}，链路 ${impactedLinkCount}）`);
@@ -2731,6 +2747,9 @@ export function App() {
                         <div><strong>LSTM预测</strong>: {seriesSnapshot.eventType}/{seriesSnapshot.metric}</div>
                         <div>entity: {seriesSnapshot.entityId || '-'}</div>
                         <div>points: {seriesSnapshot.points?.length || 0}</div>
+                        <div>model: {seriesSnapshot.modelType || '-'}@{seriesSnapshot.modelVersion || '-'}</div>
+                        <div>mape/rmse: {Number.isFinite(Number(seriesSnapshot?.metrics?.mape)) ? Number(seriesSnapshot.metrics.mape).toFixed(4) : '-'} / {Number.isFinite(Number(seriesSnapshot?.metrics?.rmse)) ? Number(seriesSnapshot.metrics.rmse).toFixed(4) : '-'}</div>
+                        <div>confidence: {seriesSnapshot?.confidence?.level || '-'}</div>
                         <div>
                           trend: {(() => {
                             const pts = seriesSnapshot.points || [];
