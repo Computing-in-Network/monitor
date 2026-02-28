@@ -75,6 +75,10 @@ const DAMAGED_NODE_COLOR = Color.fromCssColorString('#ff595e');
 const SELECTED_LINK_COLOR = Color.fromCssColorString('#f94144').withAlpha(0.95);
 const FAULT_LINK_COLOR = Color.fromCssColorString('#ff3b30').withAlpha(0.95);
 const FLOW_HIGHLIGHT_COLOR = Color.fromCssColorString('#4cc9f0').withAlpha(0.95);
+const IMPACTED_NODE_COLOR = Color.fromCssColorString('#ffd166');
+const SIM_IMPACTED_NODE_COLOR = Color.fromCssColorString('#7bdff2');
+const IMPACTED_LINK_COLOR = Color.fromCssColorString('#8ac926').withAlpha(0.96);
+const SIM_IMPACTED_LINK_COLOR = Color.fromCssColorString('#3a86ff').withAlpha(0.96);
 const STALE_WARN_MS = 2500;
 const STALE_ERROR_MS = 5000;
 const INGEST_FPS_WARN = 0.7;
@@ -123,6 +127,15 @@ function normalizeIdentity(value) {
 
 function normalizeIdentityLoose(value) {
   return normalizeIdentity(value).replace(/[^a-z0-9]/g, '');
+}
+
+function normalizeLinkPair(a, b) {
+  const x = String(a || '').trim();
+  const y = String(b || '').trim();
+  if (!x || !y) {
+    return '';
+  }
+  return x < y ? `${x}<->${y}` : `${y}<->${x}`;
 }
 
 function svgDataUri(svg) {
@@ -294,6 +307,104 @@ function filterSeriesByWindow(series, windowSec) {
   return series.filter((p) => p.t >= startTs);
 }
 
+function sampleByGranularity(points, granularity) {
+  if (!Array.isArray(points) || points.length === 0) {
+    return [];
+  }
+  const step = granularity === 'week' ? 8 : granularity === 'day' ? 4 : granularity === 'hour' ? 2 : 1;
+  return points.filter((_, idx) => idx % step === 0 || idx === points.length - 1);
+}
+
+function buildTrendPaths(historyPoints, forecastPoints, width = 620, height = 220, padding = { left: 54, right: 14, top: 14, bottom: 34 }) {
+  const hist = Array.isArray(historyPoints) ? historyPoints : [];
+  const pred = Array.isArray(forecastPoints) ? forecastPoints : [];
+  if (hist.length === 0 && pred.length === 0) {
+    return {
+      historyPath: '',
+      forecastPath: '',
+      min: 0,
+      max: 1,
+      toX: () => 0,
+      toY: () => 0,
+      plot: { x0: padding.left, y0: padding.top, w: width - padding.left - padding.right, h: height - padding.top - padding.bottom },
+      totalCount: 0
+    };
+  }
+  const all = [...hist, ...pred];
+  const values = all.map((p) => Number(p.v)).filter((v) => Number.isFinite(v));
+  if (values.length === 0) {
+    return {
+      historyPath: '',
+      forecastPath: '',
+      min: 0,
+      max: 1,
+      toX: () => 0,
+      toY: () => 0,
+      plot: { x0: padding.left, y0: padding.top, w: width - padding.left - padding.right, h: height - padding.top - padding.bottom },
+      totalCount: 0
+    };
+  }
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const span = Math.max(1e-6, max - min);
+  const totalCount = Math.max(2, all.length);
+  const plot = {
+    x0: padding.left,
+    y0: padding.top,
+    w: Math.max(10, width - padding.left - padding.right),
+    h: Math.max(10, height - padding.top - padding.bottom)
+  };
+  const xStep = plot.w / (totalCount - 1);
+  const toX = (index) => plot.x0 + index * xStep;
+  const toY = (value) => {
+    const y = plot.y0 + plot.h - ((Number(value) - min) / span) * plot.h;
+    return y;
+  };
+  const toXY = (value, index) => {
+    const x = toX(index);
+    const y = toY(value);
+    return `${x.toFixed(2)},${y.toFixed(2)}`;
+  };
+
+  let historyPath = '';
+  hist.forEach((p, idx) => {
+    historyPath += `${idx === 0 ? 'M' : 'L'}${toXY(p.v, idx)} `;
+  });
+  historyPath = historyPath.trim();
+
+  let forecastPath = '';
+  if (pred.length > 0) {
+    const offset = hist.length;
+    pred.forEach((p, idx) => {
+      const absoluteIdx = offset + idx;
+      forecastPath += `${idx === 0 ? 'M' : 'L'}${toXY(p.v, absoluteIdx)} `;
+    });
+    forecastPath = forecastPath.trim();
+  }
+  return { historyPath, forecastPath, min, max, toX, toY, plot, totalCount };
+}
+
+function formatTrendTimeLabel(t, granularity, fallback = '-') {
+  const num = Number(t);
+  if (!Number.isFinite(num) || num <= 0) {
+    return fallback;
+  }
+  const d = new Date(num);
+  if (Number.isNaN(d.getTime())) {
+    return fallback;
+  }
+  if (granularity === 'week') {
+    return `${d.getMonth() + 1}/${d.getDate()}`;
+  }
+  if (granularity === 'day') {
+    return `${d.getDate()}日`;
+  }
+  if (granularity === 'hour') {
+    return `${String(d.getHours()).padStart(2, '0')}:00`;
+  }
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+}
+
 function getAnalysisResult(payload) {
   if (!payload || typeof payload !== 'object') {
     return null;
@@ -353,10 +464,25 @@ export function App() {
   const [simulationLoading, setSimulationLoading] = useState(false);
   const [simulationResult, setSimulationResult] = useState(null);
   const [analysisSummary, setAnalysisSummary] = useState(null);
+  const [analysisDirectReason, setAnalysisDirectReason] = useState('');
+  const [analysisAiReport, setAnalysisAiReport] = useState('');
+  const [analysisAiMeta, setAnalysisAiMeta] = useState(null);
+  const [analysisAiLoading, setAnalysisAiLoading] = useState(false);
+  const [analysisAiError, setAnalysisAiError] = useState('');
   const [replayMode, setReplayMode] = useState(false);
   const [showLayerPanel, setShowLayerPanel] = useState(false);
   const [showFaultPanel, setShowFaultPanel] = useState(false);
   const [showFlowPanel, setShowFlowPanel] = useState(false);
+  const [showMonitorDiag, setShowMonitorDiag] = useState(false);
+  const [showCandidatePanel, setShowCandidatePanel] = useState(true);
+  const [showAnalysisPanel, setShowAnalysisPanel] = useState(true);
+  const [activeCandidateKey, setActiveCandidateKey] = useState('');
+  const [showReportDrawer, setShowReportDrawer] = useState(false);
+  const [reportViewMode, setReportViewMode] = useState('wide');
+  const [reportGranularity, setReportGranularity] = useState('min');
+  const [showRuntimeDrawer, setShowRuntimeDrawer] = useState(false);
+  const [bottomTab, setBottomTab] = useState('fault_analysis');
+  const [showLayerDrawer, setShowLayerDrawer] = useState(false);
   const [toast, setToast] = useState(null);
   const [layerPrefs, setLayerPrefs] = useState(() => {
     try {
@@ -397,6 +523,7 @@ export function App() {
   const replayFileInputRef = useRef(null);
   const toastTimerRef = useRef(null);
   const faultInitRef = useRef(false);
+  const aiExplainSeqRef = useRef(0);
 
   function pushToast(text, level = 'ok') {
     setToast({ text, level, id: Date.now() });
@@ -752,7 +879,47 @@ export function App() {
     setMonitorActionStatus(msg);
     pushToast(msg, ok ? 'ok' : 'warn');
   }
-  async function runAdvancedAnalysis() {
+  function focusFaultCandidate(candidate) {
+    if (!candidate) {
+      return;
+    }
+    setActiveCandidateKey(candidate.key || '');
+    if (candidate.scopeType === 'node') {
+      setSelected({ kind: 'node', id: candidate.scopeId });
+      const viewer = viewerRef.current;
+      const node = nodeStateRef.current.get(candidate.scopeId);
+      if (viewer && node) {
+        viewer.camera.flyTo({
+          destination: Cartesian3.fromDegrees(node.lon, node.lat, node.alt_m + 1_200_000),
+          duration: 0.8
+        });
+      }
+      return;
+    }
+    const p = parseScopedLink(candidate.scopeId);
+    if (p) {
+      focusLinkByNodes(p.a, p.b);
+    }
+  }
+
+  function candidateFromSelected(candidates) {
+    if (!Array.isArray(candidates) || candidates.length === 0) {
+      return null;
+    }
+    if (selected?.kind === 'node' && selected?.id) {
+      return candidates.find((x) => x.scopeType === 'node' && x.scopeId === selected.id) || null;
+    }
+    if (selected?.kind === 'link' && selectedLink) {
+      const uid = normalizeLinkPair(selectedLink.a?.id, selectedLink.b?.id);
+      if (!uid) {
+        return null;
+      }
+      return candidates.find((x) => x.scopeType === 'link' && normalizeLinkPair(...(x.scopeId || '').split('<->')) === uid) || null;
+    }
+    return null;
+  }
+
+  async function runAdvancedAnalysis(forcedScope = null) {
     if (!monitorClientRef.current || !frame) {
       setAnalysisError('分析失败：monitor API 或拓扑帧不可用');
       return;
@@ -765,22 +932,37 @@ export function App() {
     try {
       setAnalysisLoading(true);
       setAnalysisError('');
+      setAnalysisSummary(null);
+      setAnalysisDirectReason('');
+      setAnalysisAiReport('');
+      setAnalysisAiMeta(null);
+      setAnalysisAiError('');
+      setFaultSpread(null);
+      setTaskImpact(null);
       let analysisMode = 'auto';
       let scopeType = 'network';
       let scopeId = 'all';
       let entityId = '';
-      if (selected?.kind === 'link' && selectedLink) {
+      if (forcedScope?.scopeType && forcedScope?.scopeId) {
         analysisMode = 'focused';
-        scopeType = 'link';
-        scopeId = selectedLinkMetric?.linkUid || [selectedLink.a.id, selectedLink.b.id].sort().join('<->');
-        entityId = scopeId;
-      } else if (selected?.kind === 'node' && selected?.id) {
-        analysisMode = 'focused';
-        scopeType = 'node';
-        scopeId = selected.id;
-        entityId = selected.id;
-      } else if (selectedFlow?.path?.length > 1) {
-        entityId = `${selectedFlow.path[0]}->${selectedFlow.path[selectedFlow.path.length - 1]}`;
+        scopeType = forcedScope.scopeType;
+        scopeId = forcedScope.scopeId;
+        entityId = forcedScope.scopeId;
+      } else {
+        const activeCandidate = faultCandidates.find((x) => x.key === activeCandidateKey) || null;
+        const selectedCandidate = candidateFromSelected(faultCandidates);
+        const fallbackCandidate = faultCandidates[0] || null;
+        const preferred = activeCandidate || selectedCandidate || fallbackCandidate;
+        if (preferred) {
+          analysisMode = 'focused';
+          scopeType = preferred.scopeType;
+          scopeId = preferred.scopeId;
+          entityId = preferred.scopeId;
+          setActiveCandidateKey(preferred.key);
+          focusFaultCandidate(preferred);
+        } else if (selectedFlow?.path?.length > 1) {
+          entityId = `${selectedFlow.path[0]}->${selectedFlow.path[selectedFlow.path.length - 1]}`;
+        }
       }
       if (monitorEpoch == null || monitorEpoch === '') {
         const msg = '分析失败：topology_epoch 不能为空';
@@ -797,6 +979,125 @@ export function App() {
         entityId,
         linkCount: Object.keys(monitorSnapshot.byLink || {}).length
       });
+      setReportViewMode('wide');
+      setShowReportDrawer(true);
+
+      const directReasonFromMetrics = (() => {
+        if (scopeType === 'link' && scopeId) {
+          const parsed = parseScopedLink(scopeId);
+          let target = null;
+          for (const item of Object.values(monitorSnapshot.byLink || {})) {
+            if (!item || typeof item !== 'object') {
+              continue;
+            }
+            if (item.linkUid === scopeId || item.linkId === scopeId) {
+              target = item;
+              break;
+            }
+            if (parsed) {
+              const p1 = normalizeLinkPair(item.srcNodeId || item.srcNodeUid, item.dstNodeId || item.dstNodeUid);
+              if (p1 && p1 === normalizeLinkPair(parsed.a, parsed.b)) {
+                target = item;
+                break;
+              }
+            }
+          }
+          if (target) {
+            const loss = Number(target.lossRate);
+            const rtt = Number(target.rttMs);
+            const jitter = Number(target.jitterMs);
+            const state = String(target.state || '').toUpperCase();
+            const causes = [];
+            if (Number.isFinite(loss) && loss >= 0.06) causes.push(`loss=${loss.toFixed(3)}>=0.06`);
+            else if (Number.isFinite(loss) && loss >= 0.03) causes.push(`loss=${loss.toFixed(3)}>=0.03`);
+            if (Number.isFinite(rtt) && rtt >= 280) causes.push(`rtt=${rtt.toFixed(1)}>=280ms`);
+            else if (Number.isFinite(rtt) && rtt >= 180) causes.push(`rtt=${rtt.toFixed(1)}>=180ms`);
+            if (Number.isFinite(jitter) && jitter >= 35) causes.push(`jitter=${jitter.toFixed(1)}>=35ms`);
+            if (state === 'DOWN' || state === 'DEGRADED') causes.push(`state=${state}`);
+            if (causes.length > 0) {
+              return `链路 ${scopeId} 触发异常：${causes.join('，')}。`;
+            }
+          }
+        }
+        if (scopeType === 'node' && scopeId) {
+          let target = null;
+          for (const item of Object.values(monitorSnapshot.byNode || {})) {
+            if (!item || typeof item !== 'object') {
+              continue;
+            }
+            const aliases = [item.nodeId, item.nodeUid, item.topoNodeId, item.dockerName].map((x) => String(x || '').trim());
+            if (aliases.includes(scopeId)) {
+              target = item;
+              break;
+            }
+          }
+          if (target) {
+            const cpu = Number(target.cpuRatio);
+            const mem = Number(target.memRatio);
+            const status = String(target.status || '').toUpperCase();
+            const causes = [];
+            if (Number.isFinite(cpu) && cpu >= 0.92) causes.push(`cpu=${(cpu * 100).toFixed(1)}%>=92%`);
+            else if (Number.isFinite(cpu) && cpu >= 0.82) causes.push(`cpu=${(cpu * 100).toFixed(1)}%>=82%`);
+            if (Number.isFinite(mem) && mem >= 0.92) causes.push(`mem=${(mem * 100).toFixed(1)}%>=92%`);
+            else if (Number.isFinite(mem) && mem >= 0.82) causes.push(`mem=${(mem * 100).toFixed(1)}%>=82%`);
+            if (status && status !== 'UP') causes.push(`status=${status}`);
+            if (causes.length > 0) {
+              return `节点 ${scopeId} 触发异常：${causes.join('，')}。`;
+            }
+          }
+        }
+        return '';
+      })();
+      const scopeObservation = (() => {
+        if (scopeType === 'node' && scopeId) {
+          for (const item of Object.values(monitorSnapshot.byNode || {})) {
+            if (!item || typeof item !== 'object') {
+              continue;
+            }
+            const aliases = [item.nodeId, item.nodeUid, item.topoNodeId, item.dockerName].map((x) => String(x || '').trim());
+            if (!aliases.includes(scopeId)) {
+              continue;
+            }
+            return {
+              cpu_ratio: Number(item.cpuRatio),
+              mem_ratio: Number(item.memRatio),
+              status: String(item.status || '')
+            };
+          }
+          return null;
+        }
+        if (scopeType === 'link' && scopeId) {
+          const parsed = parseScopedLink(scopeId);
+          for (const item of Object.values(monitorSnapshot.byLink || {})) {
+            if (!item || typeof item !== 'object') {
+              continue;
+            }
+            if (item.linkUid === scopeId || item.linkId === scopeId) {
+              return {
+                loss_rate: Number(item.lossRate),
+                rtt_ms: Number(item.rttMs),
+                jitter_ms: Number(item.jitterMs),
+                state: String(item.state || '')
+              };
+            }
+            if (parsed) {
+              const p1 = normalizeLinkPair(item.srcNodeId || item.srcNodeUid, item.dstNodeId || item.dstNodeUid);
+              if (p1 && p1 === normalizeLinkPair(parsed.a, parsed.b)) {
+                return {
+                  loss_rate: Number(item.lossRate),
+                  rtt_ms: Number(item.rttMs),
+                  jitter_ms: Number(item.jitterMs),
+                  state: String(item.state || '')
+                };
+              }
+            }
+          }
+        }
+        return null;
+      })();
+      if (directReasonFromMetrics) {
+        setAnalysisDirectReason(directReasonFromMetrics);
+      }
 
       const runResp = await monitorClientRef.current.analyzeRun({
         mode: analysisMode,
@@ -806,7 +1107,8 @@ export function App() {
         include_debug: false,
         max_depth: analysisMode === 'focused' ? 2 : 4,
         spread_mode: analysisMode === 'focused' ? 'single_point' : 'cascade',
-        cascade_threshold: 0.6
+        cascade_threshold: 0.6,
+        scope_observation: scopeObservation || undefined
       });
       const overviewResult = (() => {
         if (runResp && typeof runResp === 'object' && runResp.contract_version) {
@@ -816,10 +1118,32 @@ export function App() {
       })();
       const spreadResult = overviewResult?.topology_impact || null;
       const impactResult = overviewResult || null;
+      if (!directReasonFromMetrics) {
+        const topFinding = Array.isArray(impactResult?.reasoning?.top_findings)
+          ? impactResult.reasoning.top_findings.find((x) => x && typeof x === 'object')
+          : null;
+        if (topFinding) {
+          const st = String(topFinding.scope_type || 'unknown');
+          const sid = String(topFinding.scope_id || '-');
+          const sev = String(topFinding.severity || 'warning');
+          const ev = Array.isArray(topFinding.evidence) ? topFinding.evidence.filter(Boolean) : [];
+          const evText = ev.length ? `，触发条件：${ev.join('、')}` : '';
+          setAnalysisDirectReason(`${st}/${sid} 出现 ${sev} 级异常${evText}。`);
+        } else {
+          setAnalysisDirectReason('未命中明确阈值证据，请查看判定依据与实时指标。');
+        }
+      }
       const impactedCount = Array.isArray(spreadResult?.impacted_nodes) ? spreadResult.impacted_nodes.length : 0;
       const taskCount = Array.isArray(impactResult?.tasks) ? impactResult.tasks.length : 0;
+      const riskLevel = String(impactResult?.summary?.risk_level || '').toLowerCase();
+      const hasTopFinding = Array.isArray(impactResult?.reasoning?.top_findings) && impactResult.reasoning.top_findings.length > 0;
       if (!spreadResult && !impactResult) {
         const msg = '高级分析返回空结果：后端未返回 result/data';
+        setAnalysisError(msg);
+        setMonitorActionStatus(msg);
+        pushToast(msg, 'warn');
+      } else if (analysisMode === 'focused' && riskLevel === 'normal' && !hasTopFinding) {
+        const msg = '当前对象无活跃异常（未命中告警证据），建议作为观察对象而非故障对象';
         setAnalysisError(msg);
         setMonitorActionStatus(msg);
         pushToast(msg, 'warn');
@@ -836,7 +1160,88 @@ export function App() {
       setFaultSpread(spreadResult);
       setTaskImpact(impactResult);
       setAnalysisOverview(overviewResult);
-      setMonitorActionStatus('已刷新高级分析结果');
+      const aiSeq = aiExplainSeqRef.current + 1;
+      aiExplainSeqRef.current = aiSeq;
+      setAnalysisAiLoading(true);
+      monitorClientRef.current.analyzeExplain({
+        analysis: overviewResult,
+        scope_type: scopeType,
+        scope_id: scopeId,
+        extra_context: {
+          direct_reason: directReasonFromMetrics || '',
+          scope_observation: scopeObservation || {},
+          security_correlation: overviewResult?.security_correlation || {},
+          impacted_nodes: spreadResult?.impacted_nodes || [],
+          impacted_links: spreadResult?.impacted_links || [],
+          tasks_top: Array.isArray(impactResult?.tasks) ? impactResult.tasks.slice(0, 8) : []
+        }
+      }).then((explainResp) => {
+        if (aiExplainSeqRef.current !== aiSeq) {
+          return;
+        }
+        setAnalysisAiReport(String(explainResp?.report || '').trim());
+        setAnalysisAiMeta({
+          source: explainResp?.source || 'unknown',
+          model: explainResp?.model || '',
+          fallbackReason: explainResp?.fallback_reason || ''
+        });
+      }).catch((explainErr) => {
+        if (aiExplainSeqRef.current !== aiSeq) {
+          return;
+        }
+        setAnalysisAiError(explainErr?.message || 'AI报告生成失败');
+        setAnalysisAiMeta(null);
+        setAnalysisAiReport('');
+      }).finally(() => {
+        if (aiExplainSeqRef.current !== aiSeq) {
+          return;
+        }
+        setAnalysisAiLoading(false);
+      });
+      if (scopeType === 'node' || scopeType === 'link') {
+        try {
+          const eventType = scopeType === 'link' ? 'link_metric' : 'node_metric';
+          const metric = scopeType === 'link' ? 'rtt_ms' : 'cpu_ratio';
+          const forecastResp = await monitorClientRef.current.getForecastLstm({
+            eventType,
+            metric,
+            entityId: scopeId,
+            strategy: 'fallback',
+            horizon: 12,
+            window: 24
+          });
+          const pointsRaw = (
+            forecastResp?.points
+            || forecastResp?.forecast
+            || forecastResp?.result?.points
+            || forecastResp?.result?.forecast
+            || forecastResp?.data?.points
+            || forecastResp?.data?.forecast
+            || []
+          );
+          const points = Array.isArray(pointsRaw)
+            ? pointsRaw
+              .map((p, idx) => ({
+                t: p?.t || p?.ts || p?.timestamp || String(idx),
+                v: Number(p?.v ?? p?.value ?? p?.y ?? p?.yhat),
+                lower: Number(p?.lower),
+                upper: Number(p?.upper)
+              }))
+              .filter((p) => Number.isFinite(p.v))
+            : [];
+          setSeriesSnapshot({
+            eventType,
+            metric,
+            entityId: scopeId,
+            points
+          });
+        } catch {
+          setSeriesSnapshot(null);
+        }
+      }
+      const impactedNodeCount = Array.isArray(spreadResult?.impacted_nodes) ? spreadResult.impacted_nodes.length : 0;
+      const impactedLinkCount = Array.isArray(spreadResult?.impacted_links) ? spreadResult.impacted_links.length : 0;
+      setMonitorActionStatus(`已刷新高级分析结果（高亮节点 ${impactedNodeCount}，链路 ${impactedLinkCount}）`);
       pushToast('高级分析已更新', 'ok');
       setAnalysisSupported(true);
     } catch (err) {
@@ -859,52 +1264,90 @@ export function App() {
       pushToast(msg, 'warn');
       return;
     }
-    let scopeId = selectedLinkMetric?.linkUid || '';
-    if (!scopeId && selectedLink) {
-      scopeId = [selectedLink.a.id, selectedLink.b.id].sort().join('<->');
-    }
-    if (!scopeId) {
-      const first = Object.values(monitorSnapshot.byLink || {})[0];
-      scopeId = first?.linkUid || '';
-    }
-    if (!scopeId) {
-      const msg = '推演失败：当前无可用链路 scope_id';
-      setMonitorActionStatus(msg);
-      pushToast(msg, 'warn');
-      return;
-    }
     try {
       setSimulationLoading(true);
+      const activeCandidate = faultCandidates.find((x) => x.key === activeCandidateKey) || null;
+      let scenarioType = 'link_down';
+      let scopeId = '';
+      let focusScopeType = 'link';
+      if (activeCandidate?.scopeType === 'node' && activeCandidate?.scopeId) {
+        scenarioType = 'node_hotspot';
+        scopeId = String(activeCandidate.scopeId);
+        focusScopeType = 'node';
+      } else if (activeCandidate?.scopeType === 'link' && activeCandidate?.scopeId) {
+        scenarioType = 'link_down';
+        scopeId = String(activeCandidate.scopeId);
+        focusScopeType = 'link';
+      } else if (selected?.kind === 'node' && selected?.id) {
+        scenarioType = 'node_hotspot';
+        scopeId = String(selected.id);
+        focusScopeType = 'node';
+      } else {
+        scopeId = selectedLinkMetric?.linkUid || '';
+        if (!scopeId && selectedLink) {
+          scopeId = [selectedLink.a.id, selectedLink.b.id].sort().join('<->');
+        }
+        if (!scopeId) {
+          const first = Object.values(monitorSnapshot.byLink || {})[0];
+          scopeId = first?.linkUid || '';
+        }
+        scenarioType = 'link_down';
+        focusScopeType = 'link';
+      }
+      if (!scopeId) {
+        const msg = '推演失败：当前无可用故障对象';
+        setMonitorActionStatus(msg);
+        pushToast(msg, 'warn');
+        return;
+      }
       const scoped = parseScopedLink(scopeId);
       const createResp = await monitorClientRef.current.createSimulation({
-        scenario_type: 'link_down',
+        scenario_type: scenarioType,
         topology_epoch: String(monitorEpoch || 1708848000),
         steps_total: 5,
-        params: {
-          link_id: scopeId,
-          src_node_id: selectedLink?.a?.id || scoped?.a || '',
-          dst_node_id: selectedLink?.b?.id || scoped?.b || ''
-        }
+        params: scenarioType === 'node_hotspot'
+          ? {
+              node_id: scopeId,
+              scope_id: scopeId
+            }
+          : {
+              link_id: scopeId,
+              scope_id: scopeId,
+              src_node_id: selectedLink?.a?.id || scoped?.a || '',
+              dst_node_id: selectedLink?.b?.id || scoped?.b || ''
+            }
       });
       const simulationId = createResp?.simulation_id || createResp?.result?.simulation_id;
       if (!simulationId) {
         throw new Error('推演创建成功但未返回 simulation_id');
       }
-      let status = createResp?.status || createResp?.result?.status || 'running';
+      let status = 'created';
+      let lastSimulation = null;
       for (let i = 0; i < 8 && status !== 'completed'; i += 1) {
         const stepResp = await monitorClientRef.current.stepSimulation(simulationId, {});
-        status = stepResp?.status || stepResp?.result?.status || status;
+        const simObj = stepResp?.simulation || stepResp?.result?.simulation || null;
+        lastSimulation = simObj || lastSimulation;
+        status = simObj?.status || status;
         if (status === 'completed') {
           break;
         }
       }
       const timelineResp = await monitorClientRef.current.getSimulationTimeline(simulationId);
       const timeline = timelineResp?.timeline || timelineResp?.result?.timeline || [];
+      const latest = Array.isArray(timeline) && timeline.length > 0
+        ? timeline[timeline.length - 1]
+        : (lastSimulation?.latest || null);
+      const first = Array.isArray(timeline) && timeline.length > 0 ? timeline[0] : null;
       setSimulationResult({
         simulationId,
+        scenarioType,
+        focusScopeType,
+        focusScopeId: scopeId,
         status,
         timelineCount: Array.isArray(timeline) ? timeline.length : 0,
-        latest: Array.isArray(timeline) && timeline.length > 0 ? timeline[timeline.length - 1] : null
+        latest,
+        first,
+        timeline: Array.isArray(timeline) ? timeline.slice(-5) : []
       });
       const msg = `推演完成：${simulationId}，timeline=${Array.isArray(timeline) ? timeline.length : 0}`;
       setMonitorActionStatus(msg);
@@ -1111,6 +1554,33 @@ export function App() {
       return;
     }
 
+    const impactedNodeSet = new Set(
+      Array.isArray(faultSpread?.impacted_nodes) ? faultSpread.impacted_nodes.map((x) => String(x || '').trim()).filter(Boolean) : []
+    );
+    const impactedLinkKeySet = new Set();
+    if (Array.isArray(faultSpread?.impacted_links)) {
+      for (const uid of faultSpread.impacted_links) {
+        const p = parseScopedLink(uid);
+        if (p?.a && p?.b) {
+          impactedLinkKeySet.add(edgeKey(p.a, p.b));
+        }
+      }
+    }
+    const simImpactedNodeSet = new Set(
+      Array.isArray(simulationResult?.latest?.impacted_nodes)
+        ? simulationResult.latest.impacted_nodes.map((x) => String(x || '').trim()).filter(Boolean)
+        : []
+    );
+    const simImpactedLinkKeySet = new Set();
+    if (Array.isArray(simulationResult?.latest?.impacted_links)) {
+      for (const uid of simulationResult.latest.impacted_links) {
+        const p = parseScopedLink(uid);
+        if (p?.a && p?.b) {
+          simImpactedLinkKeySet.add(edgeKey(p.a, p.b));
+        }
+      }
+    }
+
     const entities = viewer.entities;
     const activeNodeIds = new Set();
     const nodePositionMap = new Map();
@@ -1126,6 +1596,8 @@ export function App() {
 
       const selectedNode = selected?.kind === 'node' && selected.id === node.id;
       const isDamagedNode = damagedNodeIds.has(node.id);
+      const isImpactedNode = impactedNodeSet.has(node.id);
+      const isSimImpactedNode = simImpactedNodeSet.has(node.id);
       let nodeEntity = nodeEntitiesRef.current.get(node.id);
       const labelText = node.name || node.id;
       const labelScale = node.type === 'leo' ? 0.45 : 0.35;
@@ -1164,7 +1636,11 @@ export function App() {
         nodeEntity.billboard.scale = selectedNode ? 1.35 : 1.0;
         nodeEntity.billboard.color = isDamagedNode
           ? DAMAGED_NODE_COLOR
-          : (selectedNode ? SELECTED_NODE_COLOR : color);
+          : (
+              selectedNode
+                ? SELECTED_NODE_COLOR
+                : (isSimImpactedNode ? SIM_IMPACTED_NODE_COLOR : (isImpactedNode ? IMPACTED_NODE_COLOR : color))
+            );
       }
       if (nodeEntity.label) {
         nodeEntity.label.show = nodeVisible && layerPrefs.showLabels;
@@ -1282,6 +1758,8 @@ export function App() {
       const positions = [pa, pb];
       const selectedLink = selected?.kind === 'link' && selected.id === linkId;
       const inSelectedFlow = flowEdgeKeys.has(edgeKey(edge.a, edge.b));
+      const inAnalysisImpact = impactedLinkKeySet.has(edgeKey(edge.a, edge.b));
+      const inSimulationImpact = simImpactedLinkKeySet.has(edgeKey(edge.a, edge.b));
 
       let lineEntity = linkEntitiesRef.current.get(linkId);
       const style = resolveLinkStyle(a, b);
@@ -1306,6 +1784,10 @@ export function App() {
                 })
               : inSelectedFlow
                 ? FLOW_HIGHLIGHT_COLOR
+              : inSimulationImpact
+                ? SIM_IMPACTED_LINK_COLOR
+              : inAnalysisImpact
+                ? IMPACTED_LINK_COLOR
               : style.color
           }
         });
@@ -1315,19 +1797,23 @@ export function App() {
           selected: selectedLink,
           kind: linkKind,
           fault: linkFaulted,
-          flow: inSelectedFlow
+          flow: inSelectedFlow,
+          impacted: inAnalysisImpact,
+          simImpact: inSimulationImpact
         });
       } else {
         lineEntity.polyline.positions = positions;
       }
       const visual = linkVisualStateRef.current.get(linkId);
       const baseWidth = linkFaulted ? Math.max(style.width, 2.8) : style.width;
-      const expectedWidth = selectedLink ? baseWidth + 1.6 : (inSelectedFlow ? baseWidth + 1.0 : baseWidth);
+      const expectedWidth = selectedLink
+        ? baseWidth + 1.6
+        : (inSelectedFlow ? baseWidth + 1.0 : (inSimulationImpact ? baseWidth + 0.9 : (inAnalysisImpact ? baseWidth + 0.7 : baseWidth)));
       const widthChanged = !visual || visual.width !== expectedWidth || visual.selected !== selectedLink;
       if (widthChanged) {
         lineEntity.polyline.width = expectedWidth;
       }
-      const materialChanged = !visual || visual.selected !== selectedLink || visual.kind !== linkKind || visual.fault !== linkFaulted || visual.flow !== inSelectedFlow;
+      const materialChanged = !visual || visual.selected !== selectedLink || visual.kind !== linkKind || visual.fault !== linkFaulted || visual.flow !== inSelectedFlow || visual.impacted !== inAnalysisImpact || visual.simImpact !== inSimulationImpact;
       if (materialChanged) {
         if (selectedLink) {
           lineEntity.polyline.material = SELECTED_LINK_COLOR;
@@ -1338,6 +1824,13 @@ export function App() {
           });
         } else if (inSelectedFlow) {
           lineEntity.polyline.material = FLOW_HIGHLIGHT_COLOR;
+        } else if (inSimulationImpact) {
+          lineEntity.polyline.material = new PolylineDashMaterialProperty({
+            color: SIM_IMPACTED_LINK_COLOR,
+            dashLength: 10
+          });
+        } else if (inAnalysisImpact) {
+          lineEntity.polyline.material = IMPACTED_LINK_COLOR;
         } else {
           lineEntity.polyline.material = style.color;
         }
@@ -1348,7 +1841,9 @@ export function App() {
         selected: selectedLink,
         kind: linkKind,
         fault: linkFaulted,
-        flow: inSelectedFlow
+        flow: inSelectedFlow,
+        impacted: inAnalysisImpact,
+        simImpact: inSimulationImpact
       });
     }
 
@@ -1483,7 +1978,7 @@ export function App() {
         setSelected(null);
       }
     }
-  }, [frame, layerPrefs, selected, faults, selectedFlowId, monitorSnapshot.byFlow, monitorSnapshot.byNode]);
+  }, [frame, layerPrefs, selected, faults, selectedFlowId, monitorSnapshot.byFlow, monitorSnapshot.byNode, faultSpread, simulationResult]);
 
   const selectedNode = selected?.kind === 'node' ? nodeStateRef.current.get(selected.id) : null;
   const selectedLink = selected?.kind === 'link' ? linkStateRef.current.get(selected.id) : null;
@@ -1539,26 +2034,44 @@ export function App() {
       return null;
     })()
     : null;
-  const selectedLinkMetric = selectedLink
-    ? Object.values(monitorSnapshot.byLink).find((item) => {
-      if (!item) {
-        return false;
-      }
-      const srcCandidates = [
-        item.srcNodeId,
-        item.srcNodeUid
-      ].map((v) => resolveTopoNodeId(v) || v).map(normalizeIdentity);
-      const dstCandidates = [
-        item.dstNodeId,
-        item.dstNodeUid
-      ].map((v) => resolveTopoNodeId(v) || v).map(normalizeIdentity);
-      const aId = normalizeIdentity(selectedLink.a.id);
-      const bId = normalizeIdentity(selectedLink.b.id);
-      return (
-        (srcCandidates.includes(aId) && dstCandidates.includes(bId)) ||
-          (srcCandidates.includes(bId) && dstCandidates.includes(aId))
-      );
-    }) || null
+  const buildCanonicalLinkKey = (a, b) => {
+    const x = resolveTopoNodeId(a) || String(a || '').trim();
+    const y = resolveTopoNodeId(b) || String(b || '').trim();
+    if (!x || !y) {
+      return '';
+    }
+    return x < y ? `${x}<->${y}` : `${y}<->${x}`;
+  };
+  const monitorLinkMetricIndex = new Map();
+  const addMetricKey = (item, a, b) => {
+    const key = buildCanonicalLinkKey(a, b);
+    if (key && !monitorLinkMetricIndex.has(key)) {
+      monitorLinkMetricIndex.set(key, item);
+    }
+  };
+  for (const item of Object.values(monitorSnapshot.byLink)) {
+    if (!item) {
+      continue;
+    }
+    addMetricKey(item, item.srcNodeId, item.dstNodeId);
+    addMetricKey(item, item.srcNodeUid, item.dstNodeUid);
+    const pairFromUid = parseScopedLink(item.linkUid || '');
+    if (pairFromUid) {
+      addMetricKey(item, pairFromUid.a, pairFromUid.b);
+    }
+    const pairFromId = parseScopedLink(item.linkId || '');
+    if (pairFromId) {
+      addMetricKey(item, pairFromId.a, pairFromId.b);
+    }
+  }
+  const selectedLinkMetricKey = selectedLink
+    ? (
+      buildCanonicalLinkKey(selectedLink.a?.id, selectedLink.b?.id) ||
+      buildCanonicalLinkKey(selectedLink.a?.name, selectedLink.b?.name)
+    )
+    : '';
+  const selectedLinkMetric = selectedLinkMetricKey
+    ? (monitorLinkMetricIndex.get(selectedLinkMetricKey) || null)
     : null;
   const selectedNodeHistory = selectedNode ? metricHistoryRef.current.nodes.get(selectedNode.id) : null;
   const selectedLinkHistory = selectedLinkMetric ? metricHistoryRef.current.links.get(selectedLinkMetric.linkId) : null;
@@ -1573,13 +2086,6 @@ export function App() {
     rtt: filterSeriesByWindow(selectedLinkHistory?.rtt || [], trendWindowSec),
     jitter: filterSeriesByWindow(selectedLinkHistory?.jitter || [], trendWindowSec)
   };
-  const monitorHealthClass = monitorSnapshot.health === 'critical'
-    ? 'error'
-    : monitorSnapshot.health === 'warning'
-      ? 'warn'
-      : monitorSnapshot.health === 'unknown'
-        ? 'warn'
-        : 'ok';
   const alerts = [];
   if (!connected) {
     alerts.push({ level: 'error', text: 'WebSocket 已断开' });
@@ -1597,11 +2103,264 @@ export function App() {
     const tb = Date.parse(b.timestamp || '');
     return (Number.isFinite(tb) ? tb : 0) - (Number.isFinite(ta) ? ta : 0);
   });
+  const focusedScopeIds = (() => {
+    const ids = new Set();
+    if (selected?.kind === 'node' && selected?.id) {
+      ids.add(String(selected.id));
+    }
+    if (selected?.kind === 'link' && selectedLink) {
+      ids.add(String(selectedLink.a?.id || ''));
+      ids.add(String(selectedLink.b?.id || ''));
+      ids.add(normalizeLinkPair(selectedLink.a?.id, selectedLink.b?.id));
+    }
+    return ids;
+  })();
+  const warningBroadcastItems = timelineAlarms
+    .filter((alarm) => alarm && ['critical', 'warning'].includes(String(alarm.severity || '').toLowerCase()))
+    .sort((a, b) => {
+      const aHit = focusedScopeIds.has(String(a.scopeId || '')) || focusedScopeIds.has(String(a.scopeUid || ''));
+      const bHit = focusedScopeIds.has(String(b.scopeId || '')) || focusedScopeIds.has(String(b.scopeUid || ''));
+      if (aHit !== bHit) {
+        return aHit ? -1 : 1;
+      }
+      return 0;
+    })
+    .slice(0, 8)
+    .map((alarm) => {
+      const ts = Date.parse(alarm.timestamp || '');
+      const hhmmss = Number.isFinite(ts) ? new Date(ts).toLocaleTimeString() : '--:--:--';
+      const severity = String(alarm.severity || 'info').toUpperCase();
+      const focusMark = focusedScopeIds.has(String(alarm.scopeId || '')) || focusedScopeIds.has(String(alarm.scopeUid || '')) ? ' [关注]' : '';
+      return `[${hhmmss}] ${severity}${focusMark} ${alarm.scopeType}/${alarm.scopeId} ${alarm.title || '未命名告警'}`;
+    });
+  const warningBroadcastText = warningBroadcastItems.length > 0
+    ? warningBroadcastItems.join(' ｜ ')
+    : '当前未发现新的疑似告警，系统处于持续监视状态';
+  const warningBannerLevel = warningBroadcastItems.some((item) => item.includes('CRITICAL'))
+    ? 'critical'
+    : warningBroadcastItems.length > 0
+      ? 'warning'
+      : 'normal';
   const filteredTimelineAlarms = timelineAlarms.filter((alarm) => {
     const bySeverity = alarmSeverityFilter === 'all' || alarm.severity === alarmSeverityFilter;
     const byScope = alarmScopeFilter === 'all' || alarm.scopeType === alarmScopeFilter;
     return bySeverity && byScope;
   });
+  const autoAlarmLooksActive = (alarm) => {
+    if (!alarm || typeof alarm !== 'object') {
+      return false;
+    }
+    const scopeType = String(alarm.scopeType || '').trim();
+    const scopeId = String(alarm.scopeId || '').trim();
+    const severity = String(alarm.severity || '').toLowerCase();
+    if (!scopeType || !scopeId || !['warning', 'critical'].includes(severity)) {
+      return false;
+    }
+    if (scopeType === 'node') {
+      let metric = null;
+      const keys = [normalizeIdentity(scopeId), normalizeIdentityLoose(scopeId)].filter(Boolean);
+      for (const k of keys) {
+        const hit = nodeMetricAliasMap.get(k);
+        if (hit?.metric) {
+          metric = hit.metric;
+          break;
+        }
+      }
+      if (!metric) {
+        return false;
+      }
+      const cpu = Number(metric.cpuRatio);
+      const mem = Number(metric.memRatio);
+      const st = String(metric.status || '').toUpperCase();
+      if (severity === 'critical') {
+        return st === 'DOWN' || (Number.isFinite(cpu) && cpu >= 0.92) || (Number.isFinite(mem) && mem >= 0.92);
+      }
+      return (st && st !== 'UP') || (Number.isFinite(cpu) && cpu >= 0.82) || (Number.isFinite(mem) && mem >= 0.82);
+    }
+    if (scopeType === 'link') {
+      const p = parseScopedLink(scopeId);
+      const key = p ? buildCanonicalLinkKey(p.a, p.b) : '';
+      const metric = (key && monitorLinkMetricIndex.get(key)) || null;
+      if (!metric) {
+        return false;
+      }
+      const loss = Number(metric.lossRate);
+      const rtt = Number(metric.rttMs);
+      const jitter = Number(metric.jitterMs);
+      const st = String(metric.state || '').toUpperCase();
+      if (severity === 'critical') {
+        return st === 'DOWN' || st === 'DISCONNECTED' || (Number.isFinite(loss) && loss >= 0.06) || (Number.isFinite(rtt) && rtt >= 280);
+      }
+      return st === 'DEGRADED' || (Number.isFinite(loss) && loss >= 0.03) || (Number.isFinite(rtt) && rtt >= 180) || (Number.isFinite(jitter) && jitter >= 35);
+    }
+    return false;
+  };
+  const faultCandidates = (() => {
+    const out = [];
+    const seen = new Set();
+    for (const fault of faults) {
+      if (!fault || !fault.fault_type) {
+        continue;
+      }
+      if (fault.fault_type === 'DAMAGED') {
+        const nodeId = String(fault.target?.node_id || '').trim();
+        if (!nodeId) {
+          continue;
+        }
+        const key = `manual:node:${nodeId}:${fault.fault_id || 'na'}`;
+        if (seen.has(key)) {
+          continue;
+        }
+        seen.add(key);
+        out.push({
+          key,
+          scopeType: 'node',
+          scopeId: nodeId,
+          severity: 'critical',
+          source: 'manual',
+          faultId: fault.fault_id || '',
+          title: `手动注入节点故障 ${nodeId}`
+        });
+      } else if (fault.fault_type === 'INTERRUPTED') {
+        const a = String(fault.target?.a || '').trim();
+        const b = String(fault.target?.b || '').trim();
+        const uid = normalizeLinkPair(a, b);
+        if (!uid) {
+          continue;
+        }
+        const key = `manual:link:${uid}:${fault.fault_id || 'na'}`;
+        if (seen.has(key)) {
+          continue;
+        }
+        seen.add(key);
+        out.push({
+          key,
+          scopeType: 'link',
+          scopeId: uid,
+          severity: 'critical',
+          source: 'manual',
+          faultId: fault.fault_id || '',
+          title: `手动注入链路故障 ${uid}`
+        });
+      }
+    }
+    for (const alarm of filteredTimelineAlarms) {
+      if (!alarm || !['critical', 'warning'].includes(String(alarm.severity || '').toLowerCase())) {
+        continue;
+      }
+      if (!autoAlarmLooksActive(alarm)) {
+        continue;
+      }
+      const scopeType = String(alarm.scopeType || '').trim();
+      const scopeId = String(alarm.scopeId || '').trim();
+      if (!scopeType || !scopeId) {
+        continue;
+      }
+      const key = `auto:${scopeType}:${scopeId}`;
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      out.push({ key, scopeType, scopeId, severity: String(alarm.severity || 'warning'), source: 'auto', title: alarm.title || `${scopeType} ${scopeId}` });
+    }
+    return out.slice(0, 12);
+  })();
+  const manualNodeCandidates = faultCandidates.filter((x) => x.source === 'manual' && x.scopeType === 'node');
+  const manualLinkCandidates = faultCandidates.filter((x) => x.source === 'manual' && x.scopeType === 'link');
+  const autoNodeCandidates = faultCandidates.filter((x) => x.source === 'auto' && x.scopeType === 'node');
+  const autoLinkCandidates = faultCandidates.filter((x) => x.source === 'auto' && x.scopeType === 'link');
+  const directReasonText = analysisDirectReason;
+  const reportHistoryPoints = (() => {
+    if (!analysisSummary?.scopeType || !analysisSummary?.scopeId) {
+      return [];
+    }
+    if (analysisSummary.scopeType === 'node') {
+      const scopeId = String(analysisSummary.scopeId || '').trim();
+      const keys = [normalizeIdentity(scopeId), normalizeIdentityLoose(scopeId)].filter(Boolean);
+      let nodeId = scopeId;
+      for (const k of keys) {
+        const hit = nodeMetricAliasMap.get(k);
+        if (hit?.metric?.topoNodeId || hit?.metric?.nodeId) {
+          nodeId = String(hit.metric.topoNodeId || hit.metric.nodeId);
+          break;
+        }
+      }
+      const raw = metricHistoryRef.current.nodes.get(nodeId)?.cpu || [];
+      return raw.map((p) => ({ t: p.t, v: p.v })).filter((p) => Number.isFinite(p.v));
+    }
+    if (analysisSummary.scopeType === 'link') {
+      const scope = parseScopedLink(String(analysisSummary.scopeId || ''));
+      const key = scope ? buildCanonicalLinkKey(scope.a, scope.b) : '';
+      const metric = (key && monitorLinkMetricIndex.get(key)) || null;
+      if (!metric?.linkId) {
+        return [];
+      }
+      const raw = metricHistoryRef.current.links.get(metric.linkId)?.rtt || [];
+      return raw.map((p) => ({ t: p.t, v: p.v })).filter((p) => Number.isFinite(p.v));
+    }
+    return [];
+  })();
+  const reportForecastPointsRaw = (seriesSnapshot?.points || []).map((p) => ({ t: p.t, v: p.v })).filter((p) => Number.isFinite(p.v));
+  const reportForecastPoints = (() => {
+    if (reportForecastPointsRaw.length > 0) {
+      return reportForecastPointsRaw;
+    }
+    if (reportHistoryPoints.length < 2) {
+      return [];
+    }
+    const last = reportHistoryPoints[reportHistoryPoints.length - 1];
+    const prev = reportHistoryPoints[reportHistoryPoints.length - 2];
+    const delta = Number(last.v) - Number(prev.v);
+    const out = [];
+    for (let i = 1; i <= 12; i += 1) {
+      out.push({ t: `f-${i}`, v: Number(last.v) + delta * i });
+    }
+    return out;
+  })();
+  const reportHistoryView = sampleByGranularity(reportHistoryPoints, reportGranularity);
+  const reportForecastView = sampleByGranularity(reportForecastPoints, reportGranularity);
+  const reportTrendPaths = buildTrendPaths(reportHistoryView, reportForecastView, 620, 220);
+  const reportDividerX = (() => {
+    const histCount = reportHistoryView.length;
+    const total = histCount + reportForecastView.length;
+    if (histCount <= 0 || total <= 1) {
+      return null;
+    }
+    const x = reportTrendPaths.toX(histCount - 1);
+    return Number.isFinite(x) ? x : null;
+  })();
+  const yTicks = [
+    reportTrendPaths.max,
+    (reportTrendPaths.max + reportTrendPaths.min) / 2,
+    reportTrendPaths.min
+  ];
+  const xTicks = (() => {
+    const total = reportHistoryView.length + reportForecastView.length;
+    if (total <= 1) {
+      return [];
+    }
+    const idxList = [0, Math.floor((total - 1) * 0.25), Math.floor((total - 1) * 0.5), Math.floor((total - 1) * 0.75), total - 1];
+    const uniqueIdx = [...new Set(idxList)];
+    return uniqueIdx.map((idx) => {
+      let label = '-';
+      if (idx < reportHistoryView.length) {
+        label = formatTrendTimeLabel(reportHistoryView[idx]?.t, reportGranularity, `H${idx + 1}`);
+      } else {
+        label = `+${idx - reportHistoryView.length + 1}`;
+      }
+      return { idx, x: reportTrendPaths.toX(idx), label };
+    });
+  })();
+
+  useEffect(() => {
+    if (!activeCandidateKey) {
+      return;
+    }
+    const stillExists = faultCandidates.some((x) => x.key === activeCandidateKey);
+    if (!stillExists) {
+      setActiveCandidateKey(faultCandidates[0]?.key || '');
+    }
+  }, [faultCandidates, activeCandidateKey]);
   const scopeUidPresentCount = timelineAlarms.filter((alarm) => Boolean((alarm.scopeUid || '').trim())).length;
   const scopeUidMissingCount = Math.max(0, timelineAlarms.length - scopeUidPresentCount);
   const scopeUidCoverage = timelineAlarms.length > 0 ? (scopeUidPresentCount / timelineAlarms.length) * 100 : 0;
@@ -1612,6 +2371,25 @@ export function App() {
   const nodeCpuCoverage = nodeMetricList.length > 0 ? (nodeCpuPresentCount / nodeMetricList.length) * 100 : 0;
   const nodeMemCoverage = nodeMetricList.length > 0 ? (nodeMemPresentCount / nodeMetricList.length) * 100 : 0;
   const nodeMetricCoverageWarn = nodeMetricList.length > 0 && (nodeCpuCoverage < 80 || nodeMemCoverage < 80);
+  const stalenessMsText = `${Math.max(0, runtimeHealth.stalenessMs).toFixed(0)}ms`;
+  const ingestFpsText = runtimeHealth.ingestFps.toFixed(2);
+  const simTimeText = frame ? `${frame.sim_time_s.toFixed(1)}s` : '-';
+  const tickText = frame ? `${frame.elapsed_ms.toFixed(2)}ms` : '-';
+  const avgDegreeText = frame ? frame.metrics.avg_degree.toFixed(2) : '-';
+  const qoeImbalanceText = frame ? (frame.metrics.qoe_imbalance ?? 0).toFixed(4) : '-';
+  const mobileConnectedText = frame
+    ? `${frame.metrics.mobile_connected_count ?? 0}/${frame.nodes.filter((n) => n.type !== 'leo').length || 0}`
+    : '-';
+  const playbackText = playback.paused ? 'paused' : 'running';
+  const speedText = `${playback.speed}x`;
+  const manualFaultNodeCount = faults.filter((f) => f.fault_type === 'DAMAGED').length;
+  const manualFaultLinkCount = faults.filter((f) => f.fault_type === 'INTERRUPTED').length;
+  const monitorUpdatedText = monitorSnapshot.updatedAt
+    ? new Date(monitorSnapshot.updatedAt).toLocaleTimeString()
+    : '-';
+  const monitorLastSuccessText = monitorLastSuccessAt
+    ? new Date(monitorLastSuccessAt).toLocaleTimeString()
+    : '-';
 
   function exportMonitorSnapshotJson() {
     const payload = {
@@ -1686,116 +2464,59 @@ export function App() {
     reader.readAsText(file, 'utf-8');
   }
 
-  return (
-    <div className="app-shell">
-      <div className="hud">
-        <h1>Dynamic Topology - Deploy Check 2026-02-20</h1>
-        <p>Status: {connected ? 'connected' : 'disconnected'}</p>
-        <div className="status-badges">
-          <span className={`badge ${connected ? 'ok' : 'error'}`}>{connected ? '连接正常' : '连接中断'}</span>
-          <span className={`badge ${runtimeHealth.stalenessMs >= STALE_ERROR_MS ? 'error' : runtimeHealth.stalenessMs >= STALE_WARN_MS ? 'warn' : 'ok'}`}>
-            延迟 {runtimeHealth.stalenessMs}ms
-          </span>
-          <span className={`badge ${runtimeHealth.ingestFps > 0 && runtimeHealth.ingestFps < INGEST_FPS_WARN ? 'warn' : 'ok'}`}>
-            帧率 {runtimeHealth.ingestFps.toFixed(2)}fps
-          </span>
-        </div>
-        <div className="time-controls">
-          <button type="button" onClick={() => setPlayback((p) => ({ ...p, paused: !p.paused }))}>
-            {playback.paused ? '继续' : '暂停'}
+  function renderFaultRows(candidates, allowClear = false) {
+    if (!Array.isArray(candidates) || candidates.length === 0) {
+      return <div className="fault-empty">暂无</div>;
+    }
+    return candidates.map((x) => (
+      <div
+        key={x.key}
+        className={`candidate-row ${activeCandidateKey === x.key ? 'active' : ''}`}
+        onClick={() => focusFaultCandidate(x)}
+      >
+        <div className="candidate-main">{x.scopeType}/{x.scopeId}</div>
+        <div className="fault-row-actions">
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              focusFaultCandidate(x);
+            }}
+          >
+            定位
           </button>
-          <button type="button" onClick={stepOnce}>单步</button>
-          {SPEED_OPTIONS.map((sp) => (
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              focusFaultCandidate(x);
+              runAdvancedAnalysis({ scopeType: x.scopeType, scopeId: x.scopeId });
+            }}
+          >
+            分析
+          </button>
+          {allowClear && x.faultId ? (
             <button
               type="button"
-              key={`speed-${sp}`}
-              className={playback.speed === sp ? 'active' : ''}
-              onClick={() => setPlayback((p) => ({ ...p, speed: sp }))}
+              onClick={(e) => {
+                e.stopPropagation();
+                sendControl('clear_fault', { fault_id: x.faultId });
+              }}
             >
-              {sp}x
+              清零
             </button>
-          ))}
-          <span className="queue-chip">缓冲 {queueDepth}</span>
+          ) : null}
         </div>
-        <p>WS: {WS_URL}</p>
-        <p>t: {frame ? frame.sim_time_s.toFixed(1) : '-'} s</p>
-        <p>nodes: {frame ? frame.nodes.length : 0}</p>
-        <p>links: {frame ? frame.metrics.edge_count : 0}</p>
-        <p>avg degree: {frame ? frame.metrics.avg_degree.toFixed(2) : '-'}</p>
-        <p>mobile connected: {frame ? `${frame.metrics.mobile_connected_count ?? 0}/${(frame.nodes.filter((n) => n.type !== 'leo').length || 1)}` : '-'}</p>
-        <p>mobile ratio: {frame ? `${((frame.metrics.mobile_connected_ratio ?? 0) * 100).toFixed(1)}%` : '-'}</p>
-        <p>I(QoE-Imbalance): {frame ? (frame.metrics.qoe_imbalance ?? 0).toFixed(4) : '-'}</p>
-        <p>fault nodes: {frame ? frame.metrics.fault_node_count ?? 0 : 0}</p>
-        <p>fault links: {frame ? frame.metrics.fault_link_count ?? 0 : 0}</p>
-        <p>tick: {frame ? frame.elapsed_ms.toFixed(2) : '-'} ms</p>
-        <p>control: {controlStatus || '-'}</p>
-        <div className="alert-box">
-          {alerts.length === 0 ? (
-            <div className="alert-row ok">当前无告警</div>
-          ) : (
-            alerts.map((a, idx) => (
-              <div key={`${a.level}-${idx}`} className={`alert-row ${a.level}`}>
-                {a.text}
-              </div>
-            ))
-          )}
-        </div>
-        <div className="legend">
-          <div className="legend-item"><span className="swatch orbit" />satellite orbit</div>
-          <div className="legend-item"><span className="swatch sat-sat" />satellite-satellite link</div>
-          <div className="legend-item"><span className="swatch sat-mobile" />satellite-air/ship link</div>
-        </div>
-        <div className="layer-panel">
-          <div className="layer-header">
-            <span>图层控制</span>
-            <div className="monitor-header-actions">
-              <button type="button" onClick={() => setShowLayerPanel((v) => !v)}>{showLayerPanel ? '收起' : '展开'}</button>
-              <button type="button" onClick={resetLayerPrefs}>重置</button>
-            </div>
-          </div>
-          {showLayerPanel ? <div className="layer-grid">
-            <label><input type="checkbox" checked={layerPrefs.nodeLeo} onChange={() => toggleLayer('nodeLeo')} /> 卫星</label>
-            <label><input type="checkbox" checked={layerPrefs.nodeAircraft} onChange={() => toggleLayer('nodeAircraft')} /> 飞机</label>
-            <label><input type="checkbox" checked={layerPrefs.nodeShip} onChange={() => toggleLayer('nodeShip')} /> 舰船</label>
-            <label><input type="checkbox" checked={layerPrefs.linkSatSat} onChange={() => toggleLayer('linkSatSat')} /> 星间链路</label>
-            <label><input type="checkbox" checked={layerPrefs.linkSatMobile} onChange={() => toggleLayer('linkSatMobile')} /> 星地/空链路</label>
-            <label><input type="checkbox" checked={layerPrefs.linkOther} onChange={() => toggleLayer('linkOther')} /> 非卫星链路</label>
-            <label><input type="checkbox" checked={layerPrefs.showTrails} onChange={() => toggleLayer('showTrails')} /> 轨迹</label>
-            <label><input type="checkbox" checked={layerPrefs.showOrbits} onChange={() => toggleLayer('showOrbits')} /> 轨道环</label>
-            <label><input type="checkbox" checked={layerPrefs.showLabels} onChange={() => toggleLayer('showLabels')} /> 标签</label>
-          </div> : <div className="fault-empty">已收起</div>}
-        </div>
-        <div className="fault-panel">
-          <div className="layer-header">
-            <span>故障面板</span>
-            <div className="monitor-header-actions">
-              <button type="button" onClick={() => setShowFaultPanel((v) => !v)}>{showFaultPanel ? '收起' : '展开'}</button>
-              <button type="button" onClick={() => sendControl('list_faults')}>刷新</button>
-            </div>
-          </div>
-          {showFaultPanel ? <div className="fault-list">
-            {faults.length === 0 ? (
-              <div className="fault-empty">当前无故障注入</div>
-            ) : (
-              faults.map((fault) => (
-                <div key={fault.fault_id} className="fault-row">
-                  <div className="fault-row-title">{fault.fault_type}</div>
-                  <div className="fault-row-target">
-                    {fault.fault_type === 'DAMAGED'
-                      ? `node=${fault.target?.node_id || '-'}`
-                      : `a=${fault.target?.a || '-'}, b=${fault.target?.b || '-'}`}
-                  </div>
-                  <div className="fault-row-actions">
-                    <button type="button" onClick={() => focusFaultTarget(fault)}>定位</button>
-                    <button type="button" onClick={() => sendControl('clear_fault', { fault_id: fault.fault_id })}>解除</button>
-                  </div>
-                </div>
-              ))
-            )}
-          </div> : <div className="fault-empty">已收起</div>}
-          {showFaultPanel ? <div className="fault-row-actions fault-footer-actions">
-            <button type="button" onClick={() => sendControl('clear_all_faults')}>解除全部故障</button>
-          </div> : null}
+      </div>
+    ));
+  }
+
+  return (
+    <div className="app-shell">
+      <div className={`warning-banner ${warningBannerLevel}`}>
+        <div className="warning-banner-track">
+          <span>{warningBroadcastText}</span>
+          <span>{warningBroadcastText}</span>
         </div>
       </div>
       {hoverInfo ? (
@@ -1898,9 +2619,12 @@ export function App() {
             <div>A 高度: {selectedLink.a.alt_m.toFixed(0)} m</div>
             <div>B 高度: {selectedLink.b.alt_m.toFixed(0)} m</div>
             <div>link uid: {selectedLinkMetric?.linkUid || '-'}</div>
+            <div>match key: {selectedLinkMetricKey || '-'}</div>
             <div>monitor health: {selectedLinkMetric?.health || '-'}</div>
             <div>loss: {selectedLinkMetric?.lossRate != null ? `${(selectedLinkMetric.lossRate * 100).toFixed(2)}%` : '--'}</div>
             <div>rtt/jitter: {selectedLinkMetric?.rttMs != null ? `${selectedLinkMetric.rttMs.toFixed(1)}ms` : '--'} / {selectedLinkMetric?.jitterMs != null ? `${selectedLinkMetric.jitterMs.toFixed(1)}ms` : '--'}</div>
+            <div>tx/rx: {selectedLinkMetric?.txBps != null ? selectedLinkMetric.txBps.toFixed(1) : '--'} / {selectedLinkMetric?.rxBps != null ? selectedLinkMetric.rxBps.toFixed(1) : '--'} bps</div>
+            {!selectedLinkMetric ? <div>monitor 匹配: 未命中链路指标（请检查链路命名映射）</div> : null}
             <div className="trend-group">
               <div className="trend-title">趋势窗口（{Math.round(trendWindowSec / 60)} 分钟）</div>
               <div className="trend-row">
@@ -1943,29 +2667,322 @@ export function App() {
           </div>
         ) : null}
       </aside>
-      <div className="monitor-dock">
-        <div className="monitor-panel">
-          <div className="layer-header">
-            <span>Monitor 摘要</span>
-            <div className="monitor-header-actions">
-              <span className={`badge ${monitorHealthClass}`}>{monitorSnapshot.health}</span>
-              <button type="button" onClick={exportMonitorSnapshotJson}>导出JSON</button>
-              <button type="button" onClick={() => replayFileInputRef.current?.click()}>导入回放</button>
-              {replayMode ? (
-                <button
-                  type="button"
-                  onClick={() => {
-                    setReplayMode(false);
-                    setMonitorSourceMode('snapshot_connecting');
-                    setMonitorActionStatus('已退出回放模式，恢复实时拉取');
-                    pushToast('已退出回放模式，恢复实时拉取', 'ok');
-                  }}
-                >
-                  退出回放
-                </button>
-              ) : null}
-            </div>
+      <div className={`fault-dock ${showReportDrawer && reportViewMode === 'wide' ? 'wide-mode' : ''} ${showReportDrawer && reportViewMode === 'fullscreen' ? 'fullscreen-mode' : ''}`}>
+        <div className="fault-panel">
+          <div className="bottom-tab-row">
+            <button type="button" className={bottomTab === 'fault_analysis' ? 'active' : ''} onClick={() => setBottomTab('fault_analysis')}>故障与分析</button>
+            <button type="button" className={bottomTab === 'simulation' ? 'active' : ''} onClick={() => setBottomTab('simulation')}>推演</button>
           </div>
+          {bottomTab === 'fault_analysis' ? (
+            <div className="bottom-tab-content">
+              <div className="layer-header">
+                <span>故障与分析</span>
+                <div className="monitor-header-actions">
+                  <button type="button" onClick={runAdvancedAnalysis} disabled={analysisLoading || !analysisSupported}>{analysisLoading ? '分析中...' : (analysisSupported ? '运行分析' : '接口不可用')}</button>
+                  <button type="button" onClick={() => sendControl('list_faults')}>刷新故障</button>
+                </div>
+              </div>
+              <div className={`fault-center-layout ${showReportDrawer ? '' : 'no-report'} ${showReportDrawer && reportViewMode === 'wide' ? 'wide' : ''} ${showReportDrawer && reportViewMode === 'fullscreen' ? 'fullscreen' : ''}`}>
+                <div className="fault-center-list">
+                  <div className="layer-header">
+                    <span>自动发现</span>
+                  </div>
+                  <div className="analysis-block">
+                    <div><strong>节点故障</strong> ({autoNodeCandidates.length})</div>
+                    {renderFaultRows(autoNodeCandidates, false)}
+                  </div>
+                  <div className="analysis-block">
+                    <div><strong>链路故障</strong> ({autoLinkCandidates.length})</div>
+                    {renderFaultRows(autoLinkCandidates, false)}
+                  </div>
+                  <div className="layer-header">
+                    <span>手动注入</span>
+                    <button type="button" onClick={() => sendControl('clear_all_faults')} disabled={faults.length === 0}>全部清零</button>
+                  </div>
+                  <div className="analysis-block">
+                    <div><strong>节点故障</strong> ({manualNodeCandidates.length})</div>
+                    {renderFaultRows(manualNodeCandidates, true)}
+                  </div>
+                  <div className="analysis-block">
+                    <div><strong>链路故障</strong> ({manualLinkCandidates.length})</div>
+                    {renderFaultRows(manualLinkCandidates, true)}
+                  </div>
+                </div>
+                {showReportDrawer ? (
+                  <aside className={`analysis-report-drawer ${reportViewMode}`}>
+                    <div className="layer-header">
+                      <span>分析报告</span>
+                      <div className="monitor-header-actions">
+                        <button type="button" onClick={() => setReportViewMode((v) => (v === 'fullscreen' ? 'wide' : 'fullscreen'))}>{reportViewMode === 'fullscreen' ? '退出全屏' : '全屏'}</button>
+                        <button type="button" onClick={() => setShowReportDrawer(false)}>关闭</button>
+                      </div>
+                    </div>
+                    {analysisError ? <div className="analysis-error">{analysisError}</div> : null}
+                    {!analysisSummary && !faultSpread && !taskImpact ? <div className="fault-empty">请选择故障对象并点击分析</div> : null}
+                    {analysisSummary ? (
+                      <div className="analysis-block">
+                        <div><strong>Request</strong>: mode={analysisSummary.mode || '-'}</div>
+                        <div>scope: {analysisSummary.scopeType || '-'} / {analysisSummary.scopeId || '-'}</div>
+                        <div>entity: {analysisSummary.entityId || '-'}</div>
+                      </div>
+                    ) : null}
+                    {seriesSnapshot ? (
+                      <div className="analysis-block">
+                        <div><strong>LSTM预测</strong>: {seriesSnapshot.eventType}/{seriesSnapshot.metric}</div>
+                        <div>entity: {seriesSnapshot.entityId || '-'}</div>
+                        <div>points: {seriesSnapshot.points?.length || 0}</div>
+                        <div>
+                          trend: {(() => {
+                            const pts = seriesSnapshot.points || [];
+                            if (pts.length < 2) return '-';
+                            const d = pts[pts.length - 1].v - pts[0].v;
+                            if (d > 0.0001) return '上升';
+                            if (d < -0.0001) return '下降';
+                            return '平稳';
+                          })()}
+                        </div>
+                      </div>
+                    ) : null}
+                    <div className="analysis-block">
+                      <div className="layer-header">
+                        <span>趋势图（历史 + 预测）</span>
+                        <div className="monitor-header-actions">
+                          {['min', 'hour', 'day', 'week'].map((g) => (
+                            <button key={`g-${g}`} type="button" className={reportGranularity === g ? 'active' : ''} onClick={() => setReportGranularity(g)}>{g === 'min' ? '分' : g === 'hour' ? '时' : g === 'day' ? '日' : '周'}</button>
+                          ))}
+                        </div>
+                      </div>
+                      <svg viewBox="0 0 620 220" className="report-trend-chart">
+                        <line x1={reportTrendPaths.plot.x0} y1={reportTrendPaths.plot.y0} x2={reportTrendPaths.plot.x0} y2={reportTrendPaths.plot.y0 + reportTrendPaths.plot.h} className="report-axis" />
+                        <line x1={reportTrendPaths.plot.x0} y1={reportTrendPaths.plot.y0 + reportTrendPaths.plot.h} x2={reportTrendPaths.plot.x0 + reportTrendPaths.plot.w} y2={reportTrendPaths.plot.y0 + reportTrendPaths.plot.h} className="report-axis" />
+                        {yTicks.map((v, idx) => {
+                          const y = reportTrendPaths.toY(v);
+                          return (
+                            <g key={`yt-${idx}`}>
+                              <line x1={reportTrendPaths.plot.x0} y1={y} x2={reportTrendPaths.plot.x0 + reportTrendPaths.plot.w} y2={y} className="report-grid" />
+                              <text x={reportTrendPaths.plot.x0 - 8} y={y + 4} className="report-axis-text">{Number(v).toFixed(2)}</text>
+                            </g>
+                          );
+                        })}
+                        {xTicks.map((tick) => (
+                          <g key={`xt-${tick.idx}`}>
+                            <line x1={tick.x} y1={reportTrendPaths.plot.y0 + reportTrendPaths.plot.h} x2={tick.x} y2={reportTrendPaths.plot.y0 + reportTrendPaths.plot.h + 5} className="report-axis" />
+                            <text x={tick.x} y={reportTrendPaths.plot.y0 + reportTrendPaths.plot.h + 18} textAnchor="middle" className="report-axis-text">{tick.label}</text>
+                          </g>
+                        ))}
+                        {reportDividerX != null ? <line x1={reportDividerX} y1={reportTrendPaths.plot.y0} x2={reportDividerX} y2={reportTrendPaths.plot.y0 + reportTrendPaths.plot.h} className="report-trend-divider" /> : null}
+                        <path className="report-trend-history" d={reportTrendPaths.historyPath} />
+                        <path className="report-trend-forecast" d={reportTrendPaths.forecastPath} />
+                      </svg>
+                      <div className="report-trend-legend">
+                        <span className="legend-swatch history"></span>历史
+                        <span className="legend-swatch forecast"></span>LSTM预测
+                      </div>
+                    </div>
+                    {faultSpread ? (
+                      <div className="analysis-block">
+                        <div><strong>Topology Impact</strong></div>
+                        <div>seeds: {faultSpread.seed_nodes?.length ?? 0}, impacted_nodes: {faultSpread.impacted_nodes?.length ?? 0}</div>
+                        <div>impacted_links: {faultSpread.impacted_links?.length ?? 0}, boundary: {faultSpread.boundary_nodes?.length ?? 0}</div>
+                      </div>
+                    ) : null}
+                    {directReasonText ? (
+                      <div className="analysis-block">
+                        <div><strong>直接原因</strong></div>
+                        <div>{directReasonText}</div>
+                      </div>
+                    ) : null}
+                    {taskImpact?.reasoning ? (
+                      <div className="analysis-block">
+                        <div><strong>判定依据</strong>: {taskImpact.reasoning.fault_domain || '-'}</div>
+                        <div>{taskImpact.reasoning.note || '-'}</div>
+                      </div>
+                    ) : null}
+                    {taskImpact?.security_correlation ? (
+                      <div className="analysis-block">
+                        <div><strong>安全联动</strong>: {taskImpact.security_correlation.level || 'none'} (score={Number(taskImpact.security_correlation.score || 0).toFixed(2)})</div>
+                        <div>security_events: {taskImpact.security_correlation.matched_security_events ?? 0}, window: {taskImpact.security_correlation.window_sec ?? '-'}s</div>
+                        <div>evidence: {Array.isArray(taskImpact.security_correlation.evidence) ? taskImpact.security_correlation.evidence.map((e) => `${e.type}:${e.detail}`).slice(0, 2).join(' | ') : '-'}</div>
+                      </div>
+                    ) : null}
+                    {taskImpact?.narrative ? (
+                      <div className="analysis-block">
+                        <div><strong>人类可读结论</strong>: {taskImpact.narrative.verdict || '-'}</div>
+                        <div>{taskImpact.narrative.summary_sentence || '-'}</div>
+                      </div>
+                    ) : null}
+                    <div className="analysis-block">
+                      <div><strong>AI详细报告</strong>{analysisAiMeta?.model ? ` (${analysisAiMeta.model})` : ''}</div>
+                      <div>固定信息: risk={taskImpact?.summary?.risk_level || taskImpact?.risk_level || '-'}, impacted_nodes={faultSpread?.impacted_nodes?.length ?? 0}, impacted_links={faultSpread?.impacted_links?.length ?? 0}</div>
+                      {directReasonText ? <div>固定原因: {directReasonText}</div> : null}
+                      {analysisAiLoading ? <div>生成中...</div> : null}
+                      {analysisAiError ? <div className="analysis-error">{analysisAiError}</div> : null}
+                      {analysisAiMeta?.source === 'fallback' ? <div>当前使用规则兜底报告：{analysisAiMeta?.fallbackReason || 'ollama unavailable'}</div> : null}
+                      {analysisAiReport ? <div className="analysis-ai-report">{analysisAiReport}</div> : (!analysisAiLoading ? <div className="fault-empty">暂无AI报告</div> : null)}
+                    </div>
+                  </aside>
+                ) : null}
+              </div>
+            </div>
+          ) : null}
+          {bottomTab === 'simulation' ? (
+            <div className="monitor-analysis bottom-tab-content">
+              <div className="layer-header">
+                <span>推演</span>
+                <div className="monitor-header-actions">
+                  <button type="button" onClick={runSimulationFlow} disabled={simulationLoading}>{simulationLoading ? '推演中...' : '运行推演'}</button>
+                </div>
+              </div>
+              {simulationResult ? (
+                <div className="analysis-block">
+                  <div><strong>Simulation</strong>: {simulationResult.simulationId}</div>
+                  <div>scenario: {simulationResult.scenarioType || '-'}</div>
+                  <div>focus: {simulationResult.focusScopeType || '-'} / {simulationResult.focusScopeId || '-'}</div>
+                  <div>status: {simulationResult.status || '-'}</div>
+                  <div>timeline: {simulationResult.timelineCount}</div>
+                  <div>latest_risk: {simulationResult.latest?.risk_level || simulationResult.latest?.risk || '-'}</div>
+                  <div>impacted_nodes: {simulationResult.latest?.impacted_nodes ?? '-'} ({simulationResult.latest?.delta?.impacted_nodes != null ? `${simulationResult.latest.delta.impacted_nodes >= 0 ? '+' : ''}${simulationResult.latest.delta.impacted_nodes}` : '-'})</div>
+                  <div>impacted_links: {simulationResult.latest?.impacted_links ?? '-'} ({simulationResult.latest?.delta?.impacted_links != null ? `${simulationResult.latest.delta.impacted_links >= 0 ? '+' : ''}${simulationResult.latest.delta.impacted_links}` : '-'})</div>
+                  <div>direct_reason: {simulationResult.latest?.direct_reason || '-'}</div>
+                  <div>next_action: {simulationResult.latest?.next_action || '-'}</div>
+                  {Array.isArray(simulationResult.latest?.primary_faults) && simulationResult.latest.primary_faults.length > 0 ? (
+                    <div>
+                      primary_faults: {simulationResult.latest.primary_faults.map((x) => `${x.scope_type}/${x.scope_id}(${x.severity || '-'})`).join(' | ')}
+                    </div>
+                  ) : null}
+                </div>
+              ) : <div className="fault-empty">尚未运行推演</div>}
+            </div>
+          ) : null}
+        </div>
+      </div>
+      <button
+        type="button"
+        className="runtime-fab"
+        onClick={() => {
+          setShowRuntimeDrawer((v) => !v);
+          setShowLayerDrawer(false);
+        }}
+      >
+        运行信息
+      </button>
+      <button
+        type="button"
+        className="layer-fab"
+        onClick={() => {
+          setShowLayerDrawer((v) => !v);
+          setShowRuntimeDrawer(false);
+        }}
+      >
+        图层开关
+      </button>
+      {showRuntimeDrawer ? (
+        <div className="layer-modal-backdrop" onClick={() => setShowRuntimeDrawer(false)}>
+          <div className="layer-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="layer-header">
+              <span>运行信息</span>
+              <button type="button" onClick={() => setShowRuntimeDrawer(false)}>关闭</button>
+            </div>
+            <div className="analysis-block">
+              <div>WS: {WS_URL} / t: {frame ? frame.sim_time_s.toFixed(1) : '-'} s / tick: {frame ? frame.elapsed_ms.toFixed(2) : '-'} ms</div>
+              <div>nodes: {frame ? frame.nodes.length : 0}, links: {frame ? frame.metrics.edge_count : 0}, avg degree: {frame ? frame.metrics.avg_degree.toFixed(2) : '-'}</div>
+              <div>mobile connected: {frame ? `${frame.metrics.mobile_connected_count ?? 0}/${(frame.nodes.filter((n) => n.type !== 'leo').length || 1)}` : '-'} / ratio: {frame ? `${((frame.metrics.mobile_connected_ratio ?? 0) * 100).toFixed(1)}%` : '-'}</div>
+              <div>I(QoE-Imbalance): {frame ? (frame.metrics.qoe_imbalance ?? 0).toFixed(4) : '-'} / queue: {queueDepth}</div>
+              <div className="time-controls">
+                <button type="button" onClick={() => setPlayback((p) => ({ ...p, paused: !p.paused }))}>{playback.paused ? '继续' : '暂停'}</button>
+                <button type="button" onClick={stepOnce}>单步</button>
+                {SPEED_OPTIONS.map((sp) => (
+                  <button type="button" key={`speed-runtime-${sp}`} className={playback.speed === sp ? 'active' : ''} onClick={() => setPlayback((p) => ({ ...p, speed: sp }))}>{sp}x</button>
+                ))}
+              </div>
+            </div>
+            <div className="layer-header">
+              <span>监控诊断</span>
+              <button type="button" onClick={() => setShowMonitorDiag((v) => !v)}>{showMonitorDiag ? '收起' : '展开'}</button>
+            </div>
+            {showMonitorDiag ? (
+              <div className="analysis-block">
+                <div>source: {monitorSourceMode} / epoch: {monitorEpoch ?? '-'}</div>
+                <div>collector nats: {collectorHealth?.nats_connected == null ? '-' : (collectorHealth.nats_connected ? 'up' : 'down')} / alarms: {monitorSnapshot.alarmCount}</div>
+                <div>snapshot: {monitorUpdatedText} / last_ok: {monitorLastSuccessText} / failures: {monitorConsecutiveFailures}</div>
+                <div>scope_uid: {scopeUidCoverage.toFixed(1)}% / cpu/mem_cov: {nodeCpuCoverage.toFixed(1)}% / {nodeMemCoverage.toFixed(1)}%</div>
+                {monitorAvailableEpochs.length > 0 ? (
+                  <div className="monitor-epoch-row">
+                    <span>epoch</span>
+                    <select value={String(monitorEpoch ?? '')} onChange={(e) => setMonitorEpoch(Number(e.target.value))}>
+                      {monitorAvailableEpochs.map((ep) => (
+                        <option key={`ep-runtime-${ep}`} value={String(ep)}>{ep}</option>
+                      ))}
+                    </select>
+                  </div>
+                ) : null}
+                <div className="monitor-filter-row">
+                  <span>告警过滤</span>
+                  <select value={alarmSeverityFilter} onChange={(e) => setAlarmSeverityFilter(e.target.value)}>
+                    <option value="all">severity: all</option>
+                    <option value="critical">severity: critical</option>
+                    <option value="warning">severity: warning</option>
+                    <option value="info">severity: info</option>
+                  </select>
+                  <select value={alarmScopeFilter} onChange={(e) => setAlarmScopeFilter(e.target.value)}>
+                    <option value="all">scope: all</option>
+                    <option value="node">scope: node</option>
+                    <option value="link">scope: link</option>
+                    <option value="flow">scope: flow</option>
+                  </select>
+                </div>
+                {monitorError ? <div className="analysis-error">{monitorError}</div> : null}
+              </div>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
+      {showLayerDrawer ? (
+        <div className="layer-modal-backdrop" onClick={() => setShowLayerDrawer(false)}>
+          <div className="layer-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="layer-header">
+              <span>图层选择</span>
+              <button type="button" onClick={() => setShowLayerDrawer(false)}>关闭</button>
+            </div>
+            <div className="layer-grid">
+              <label><input type="checkbox" checked={layerPrefs.nodeLeo} onChange={() => toggleLayer('nodeLeo')} /> 卫星</label>
+              <label><input type="checkbox" checked={layerPrefs.nodeAircraft} onChange={() => toggleLayer('nodeAircraft')} /> 飞机</label>
+              <label><input type="checkbox" checked={layerPrefs.nodeShip} onChange={() => toggleLayer('nodeShip')} /> 舰船</label>
+              <label><input type="checkbox" checked={layerPrefs.linkSatSat} onChange={() => toggleLayer('linkSatSat')} /> 星间链路</label>
+              <label><input type="checkbox" checked={layerPrefs.linkSatMobile} onChange={() => toggleLayer('linkSatMobile')} /> 星地/空链路</label>
+              <label><input type="checkbox" checked={layerPrefs.linkOther} onChange={() => toggleLayer('linkOther')} /> 非卫星链路</label>
+              <label><input type="checkbox" checked={layerPrefs.showTrails} onChange={() => toggleLayer('showTrails')} /> 轨迹</label>
+              <label><input type="checkbox" checked={layerPrefs.showOrbits} onChange={() => toggleLayer('showOrbits')} /> 轨道环</label>
+              <label><input type="checkbox" checked={layerPrefs.showLabels} onChange={() => toggleLayer('showLabels')} /> 标签</label>
+            </div>
+            <div className="fault-row-actions"><button type="button" onClick={resetLayerPrefs}>重置图层</button></div>
+          </div>
+        </div>
+      ) : null}
+      <div className="bottom-statusbar">
+        <div className="bottom-statusbar-track">
+          <span className={`badge ${connected ? 'ok' : 'error'}`}>{connected ? 'WS 正常' : 'WS 断开'}</span>
+          <span className={`badge ${runtimeHealth.stalenessMs >= STALE_ERROR_MS ? 'error' : runtimeHealth.stalenessMs >= STALE_WARN_MS ? 'warn' : 'ok'}`}>延迟 <span className="status-value value-ms">{stalenessMsText}</span></span>
+          <span className="status-chip">sim <span className="status-value value-time">{simTimeText}</span></span>
+          <span className="status-chip">tick <span className="status-value value-ms">{tickText}</span></span>
+          <span className="status-chip">fps <span className="status-value value-fps">{ingestFpsText}</span></span>
+          <span className="status-chip">play <span className="status-value value-domain">{playbackText}</span></span>
+          <span className="status-chip">speed <span className="status-value value-fps">{speedText}</span></span>
+          <span className="status-chip">queue <span className="status-value value-int">{queueDepth}</span></span>
+          <span className="status-chip">nodes <span className="status-value value-int">{frame ? frame.nodes.length : 0}</span></span>
+          <span className="status-chip">links <span className="status-value value-int">{frame ? frame.metrics.edge_count : 0}</span></span>
+          <span className="status-chip">avg_degree <span className="status-value value-fps">{avgDegreeText}</span></span>
+          <span className="status-chip">mobile <span className="status-value value-domain">{mobileConnectedText}</span></span>
+          <span className="status-chip">QoE-I <span className="status-value value-pct">{qoeImbalanceText}</span></span>
+          <span className="status-chip">manual_fault(node/link) <span className="status-value value-domain">{manualFaultNodeCount}/{manualFaultLinkCount}</span></span>
+          <span className="status-chip">monitor_alarms <span className="status-value value-int">{monitorSnapshot.alarmCount}</span></span>
+          <span className={`status-chip ${scopeUidCoverageWarn ? 'status-chip-warn' : ''}`}>scope_uid <span className="status-value value-pct">{scopeUidCoverage.toFixed(1)}%</span></span>
+          <span className={`status-chip ${nodeMetricCoverageWarn ? 'status-chip-warn' : ''}`}>cpu/mem_cov <span className="status-value value-domain">{nodeCpuCoverage.toFixed(1)}%/{nodeMemCoverage.toFixed(1)}%</span></span>
+          <span className="status-chip">monitor_last <span className="status-value value-time">{monitorUpdatedText}</span></span>
+          <span className="status-chip">snapshot_ok <span className="status-value value-time">{monitorLastSuccessText}</span></span>
+          <span className="status-chip">snapshot_fail <span className="status-value value-int">{monitorConsecutiveFailures}</span></span>
+          <button type="button" className="status-btn" onClick={exportMonitorSnapshotJson}>导出JSON</button>
+          <button type="button" className="status-btn" onClick={() => replayFileInputRef.current?.click()}>导入回放</button>
           <input
             ref={replayFileInputRef}
             type="file"
@@ -1977,184 +2994,7 @@ export function App() {
               e.target.value = '';
             }}
           />
-          <p>mode: {monitorSourceMode}</p>
-          <p>failures: {monitorConsecutiveFailures}</p>
-          <p>last success: {monitorLastSuccessAt ? new Date(monitorLastSuccessAt).toLocaleTimeString() : '-'}</p>
-          <p>collector nats: {collectorHealth?.nats_connected == null ? '-' : (collectorHealth.nats_connected ? 'up' : 'down')}</p>
-          <p>collector total: {collectorMetrics?.total ?? collectorMetrics?.requests_total ?? collectorMetrics?.request_total ?? '-'}</p>
-          <p>collector success_rate: {collectorMetrics?.success_rate != null ? Number(collectorMetrics.success_rate).toFixed(2) : (collectorMetrics?.availability != null ? Number(collectorMetrics.availability).toFixed(2) : '-')}</p>
-          <div className="monitor-epoch-row">
-            <span>epoch</span>
-            <select
-              value={monitorEpoch ?? ''}
-              onChange={(e) => setMonitorEpoch(e.target.value ? Number(e.target.value) : null)}
-            >
-              {monitorAvailableEpochs.length === 0 ? (
-                <option value={monitorEpoch ?? ''}>{monitorEpoch ?? '-'}</option>
-              ) : (
-                monitorAvailableEpochs.map((epoch) => (
-                  <option key={`epoch-${epoch}`} value={epoch}>{epoch}</option>
-                ))
-              )}
-            </select>
-          </div>
-          <p>updated: {monitorSnapshot.updatedAt || '-'}</p>
-          <p>nodes: {monitorSnapshot.nodeCount}</p>
-          <p>links: {monitorSnapshot.linkCount}</p>
-          <p>flows: {monitorSnapshot.flowCount}</p>
-          <p>alarms: {monitorSnapshot.alarmCount}</p>
-          <p>critical alarms: {monitorSnapshot.criticalAlarmCount}</p>
-          <p>warning alarms: {monitorSnapshot.warningAlarmCount}</p>
-          <div className="coverage-wrap">
-            <div className="coverage-head">
-              <span>scope_uid 覆盖</span>
-              <span>{scopeUidCoverage.toFixed(1)}% / 缺失 {scopeUidMissingCount}</span>
-            </div>
-            <div className={`coverage-bar ${scopeUidCoverageWarn ? 'warn' : ''}`}>
-              <div style={{ width: `${Math.max(0, Math.min(100, scopeUidCoverage))}%` }} />
-            </div>
-          </div>
-          <div className="coverage-wrap">
-            <div className="coverage-head">
-              <span>node 指标覆盖</span>
-              <span>cpu {nodeCpuCoverage.toFixed(1)}% / mem {nodeMemCoverage.toFixed(1)}%</span>
-            </div>
-            <div className={`coverage-bar ${nodeMetricCoverageWarn ? 'warn' : ''}`}>
-              <div style={{ width: `${Math.max(0, Math.min(100, Math.min(nodeCpuCoverage, nodeMemCoverage)))}%` }} />
-            </div>
-          </div>
-          {monitorError ? <p>error: {monitorError}</p> : null}
-          {monitorActionStatus ? <p className="monitor-action-note">最近操作: {monitorActionStatus}</p> : null}
-          <div className="monitor-filter-row">
-            <select value={alarmSeverityFilter} onChange={(e) => setAlarmSeverityFilter(e.target.value)}>
-              <option value="all">severity: all</option>
-              <option value="critical">critical</option>
-              <option value="warning">warning</option>
-              <option value="info">info</option>
-            </select>
-            <select value={alarmScopeFilter} onChange={(e) => setAlarmScopeFilter(e.target.value)}>
-              <option value="all">scope: all</option>
-              <option value="node">node</option>
-              <option value="link">link</option>
-              <option value="path">path</option>
-            </select>
-          </div>
-          <div className="monitor-alarm-list">
-            {filteredTimelineAlarms.length === 0 ? (
-              <div className="fault-empty">暂无 monitor 告警</div>
-            ) : (
-              filteredTimelineAlarms.slice(0, 6).map((alarm) => (
-                <div
-                  key={alarm.id}
-                  className={`monitor-alarm-row severity-${alarm.severity || 'info'} ${selectedMonitorAlarmId === alarm.id ? 'active' : ''}`}
-                >
-                  <div className="monitor-alarm-main">
-                    <strong>{alarm.title}</strong>
-                  </div>
-                  <div className="monitor-alarm-sub">{alarm.timestamp || '-'} | {alarm.scopeType}/{alarm.scopeId}</div>
-                  <button type="button" onClick={() => focusMonitorAlarm(alarm)}>定位</button>
-                </div>
-              ))
-            )}
-          </div>
-
-          <div className="monitor-flow-list">
-            <div className="layer-header">
-              <span>flow 路径</span>
-              <div className="monitor-header-actions">
-                <button type="button" onClick={() => setShowFlowPanel((v) => !v)}>{showFlowPanel ? '收起' : '展开'}</button>
-                <button type="button" onClick={() => setSelectedFlowId(null)}>清除高亮</button>
-              </div>
-            </div>
-            {!showFlowPanel ? (
-              <div className="fault-empty">已收起</div>
-            ) : Object.values(monitorSnapshot.byFlow).length === 0 ? (
-              <div className="fault-empty">暂无 flow 数据</div>
-            ) : (
-              Object.values(monitorSnapshot.byFlow).slice(0, 3).map((flow) => (
-                <div key={flow.flowId} className={`monitor-flow-row ${selectedFlowId === flow.flowId ? 'active' : ''}`}>
-                  <div><strong>{flow.flowId}</strong> {flow.bps != null ? `${flow.bps.toFixed(1)} bps` : ''}</div>
-                  <div className="monitor-alarm-sub">{(flow.path || []).join(' -> ') || '-'}</div>
-                  <button type="button" onClick={() => setSelectedFlowId(flow.flowId)}>高亮路径</button>
-                </div>
-              ))
-            )}
-          </div>
-          <div className="monitor-analysis">
-            <div className="layer-header">
-              <span>高级分析</span>
-              <div className="monitor-header-actions">
-                <button type="button" onClick={runAdvancedAnalysis} disabled={analysisLoading || !analysisSupported}>{analysisLoading ? '分析中...' : (analysisSupported ? '运行分析' : '接口不可用')}</button>
-                <button type="button" onClick={runSimulationFlow} disabled={simulationLoading}>{simulationLoading ? '推演中...' : '运行推演'}</button>
-              </div>
-            </div>
-            {analysisError ? <div className="analysis-error">{analysisError}</div> : null}
-            {analysisSummary ? (
-              <div className="analysis-block">
-                <div><strong>Request</strong>: mode={analysisSummary.mode || '-'}</div>
-                <div>scope: {analysisSummary.scopeType || '-'} / {analysisSummary.scopeId || '-'}</div>
-                <div>epoch: {analysisSummary.topologyEpoch || '-'}</div>
-                <div>entity: {analysisSummary.entityId || '-'}</div>
-                <div>links: {analysisSummary.linkCount ?? '-'}</div>
-              </div>
-            ) : null}
-            {seriesSnapshot ? (
-              <div className="analysis-block">
-                <div><strong>Series</strong>: metric=rtt_ms</div>
-                <div>points: {seriesSnapshot.points?.length ?? seriesSnapshot.items?.length ?? seriesSnapshot.series?.length ?? '-'}</div>
-              </div>
-            ) : null}
-            {pathAnalysis ? (
-              <div className="analysis-block">
-                <div><strong>Path</strong>: {pathAnalysis.src || '-'} -&gt; {pathAnalysis.dst || '-'}</div>
-                <div>TopN: {pathAnalysis.top_n ?? '-'}, candidates: {pathAnalysis.total_candidates ?? '-'}</div>
-                <div>paths: {pathAnalysis.paths?.length ?? 0}, best score: {pathAnalysis.paths?.[0]?.score ?? '-'}</div>
-              </div>
-            ) : null}
-            {faultSpread ? (
-              <div className="analysis-block">
-                <div><strong>Topology Impact</strong></div>
-                <div>seeds: {faultSpread.seed_nodes?.length ?? 0}, impacted_nodes: {faultSpread.impacted_nodes?.length ?? 0}</div>
-                <div>impacted_links: {faultSpread.impacted_links?.length ?? 0}, boundary: {faultSpread.boundary_nodes?.length ?? 0}</div>
-              </div>
-            ) : null}
-            {taskImpact ? (
-              <div className="analysis-block">
-                <div><strong>Overview</strong>: {taskImpact.contract_version || 'analysis.v1'}</div>
-                <div>risk: {taskImpact.summary?.risk_level || '-'}, tasks: {taskImpact.summary?.task_total ?? taskImpact.tasks?.length ?? '-'}</div>
-                <div>high_priority: {taskImpact.summary?.high_priority_tasks ?? '-'}, avg_score: {taskImpact.summary?.average_priority_score ?? '-'}</div>
-                <div>alerts: {taskImpact.alerts?.length ?? 0}, top_task: {taskImpact.tasks?.[0]?.task_id || '-'}</div>
-              </div>
-            ) : null}
-            {Array.isArray(taskImpact?.clusters) && taskImpact.clusters.length > 0 ? (
-              <div className="analysis-block">
-                <div><strong>故障簇</strong>: {taskImpact.clusters.length}</div>
-                {taskImpact.clusters.slice(0, 3).map((c) => (
-                  <div key={c.cluster_id}>
-                    {c.cluster_id}: seeds(node/link)={c.seed_nodes?.length || 0}/{c.seed_links?.length || 0},
-                    impacted(node/link)={c.impacted_nodes_count || 0}/{c.impacted_links_count || 0},
-                    contribution={(Number(c.contribution_ratio || 0) * 100).toFixed(1)}%
-                  </div>
-                ))}
-              </div>
-            ) : null}
-            {taskImpact?.narrative ? (
-              <div className="analysis-block">
-                <div><strong>人类可读结论</strong>: {taskImpact.narrative.verdict || '-'}</div>
-                <div>{taskImpact.narrative.summary_sentence || '-'}</div>
-                <div>建议动作: {taskImpact.narrative.next_action || '-'}</div>
-                <div>优先任务: {taskImpact.narrative.top_task_id || '-'}</div>
-              </div>
-            ) : null}
-            {simulationResult ? (
-              <div className="analysis-block">
-                <div><strong>Simulation</strong>: {simulationResult.simulationId}</div>
-                <div>status: {simulationResult.status || '-'}</div>
-                <div>timeline: {simulationResult.timelineCount}</div>
-                <div>latest_risk: {simulationResult.latest?.risk_level || simulationResult.latest?.risk || '-'}</div>
-              </div>
-            ) : null}
-          </div>
+          {monitorActionStatus ? <span className="status-note">最近操作: {monitorActionStatus}</span> : null}
         </div>
       </div>
       <div ref={containerRef} style={{ width: '100%', height: '100%' }} />

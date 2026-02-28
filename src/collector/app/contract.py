@@ -8,6 +8,7 @@ ALLOWED_NODE_STATUS = {"UP", "DOWN", "DEGRADED"}
 ALLOWED_LINK_STATE = {"UP", "DOWN", "DEGRADED"}
 ALLOWED_SEVERITY = {"critical", "warning", "info"}
 ALLOWED_SCOPE_TYPE = {"node", "link", "path"}
+ALLOWED_ALARM_CATEGORY = {"network", "security", "system"}
 
 
 class ContractError(ValueError):
@@ -74,7 +75,13 @@ def validate_payload(event_type: str, payload: dict[str, Any]) -> None:
         _require(payload, "alarm_id")
         severity = payload.get("severity")
         scope_type = payload.get("scope_type")
+        category = payload.get("category")
         if severity is not None and severity not in ALLOWED_SEVERITY:
             raise ContractError("INVALID_PAYLOAD", "severity 仅支持 critical|warning|info")
         if scope_type is not None and scope_type not in ALLOWED_SCOPE_TYPE:
             raise ContractError("INVALID_PAYLOAD", "scope_type 仅支持 node|link|path")
+        if category is not None and str(category).strip().lower() not in ALLOWED_ALARM_CATEGORY:
+            raise ContractError("INVALID_PAYLOAD", "category 仅支持 network|security|system")
+        tags = payload.get("security_tags")
+        if tags is not None and not isinstance(tags, list):
+            raise ContractError("INVALID_PAYLOAD", "security_tags 必须为数组")
