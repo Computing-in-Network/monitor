@@ -407,6 +407,16 @@ export class MonitorApiClient {
     return data;
   }
 
+  async analysisCopilot(payload, options = {}) {
+    const { data } = await this._request('/api/v1/bff/analysis/copilot', {
+      method: 'POST',
+      json: true,
+      body: JSON.stringify(payload || {}),
+      token: options.token
+    });
+    return data;
+  }
+
   async analyzeGlobalImpact(payload, options = {}) {
     const { data } = await this._request('/api/v1/bff/analysis/global-impact', {
       method: 'POST',

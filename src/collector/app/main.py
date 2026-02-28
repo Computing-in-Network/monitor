@@ -1045,6 +1045,55 @@ def create_app() -> FastAPI:
             detail=_analysis_error("AI_UNAVAILABLE", err or f"{provider} unavailable"),
         )
 
+    @app.post("/api/v1/bff/analysis/copilot")
+    async def bff_analysis_copilot(payload: dict[str, object]) -> dict[str, object]:
+        analysis = payload.get("analysis")
+        question = str(payload.get("question") or "").strip()
+        if not isinstance(analysis, dict):
+            raise HTTPException(status_code=422, detail="analysis(object) 为必填")
+        if not question:
+            raise HTTPException(status_code=422, detail="question(string) 为必填")
+        session_id = str(payload.get("session_id") or f"copilot-{int(time.time() * 1000)}")
+        history = payload.get("history") if isinstance(payload.get("history"), list) else []
+        provider = str(payload.get("provider") or os.getenv("AI_PROVIDER") or "newapi").strip().lower()
+        if provider not in {"newapi", "gemini", "ollama"}:
+            provider = "newapi"
+        model = str(
+            payload.get("model")
+            or (os.getenv("OLLAMA_MODEL") if provider == "ollama" else os.getenv("AI_MODEL_NAME") or os.getenv("GEMINI_MODEL"))
+            or "qwen3-coder:latest"
+        ).strip() or "qwen3-coder:latest"
+        prompt = _build_copilot_prompt(analysis=analysis, question=question, history=history)
+        if provider == "ollama":
+            text, _, err, used_model = _ollama_generate(prompt=prompt, model=model)
+        else:
+            text, _, err, used_model = _newapi_generate(prompt=prompt, model=model)
+        if not text:
+            answer = _copilot_rule_fallback(analysis=analysis, question=question)
+            refs = _copilot_references(analysis=analysis)
+            return {
+                "status": "ok",
+                "session_id": session_id,
+                "answer": answer,
+                "references": refs,
+                "confidence": "low",
+                "fallback": True,
+                "fallback_reason": err or f"{provider} unavailable",
+                "source": "rule_fallback",
+                "model": used_model or model,
+            }
+        refs = _copilot_references(analysis=analysis)
+        return {
+            "status": "ok",
+            "session_id": session_id,
+            "answer": text.strip(),
+            "references": refs,
+            "confidence": "medium",
+            "fallback": False,
+            "source": provider,
+            "model": used_model,
+        }
+
     @app.post("/api/v1/bff/simulation/create")
     async def simulation_create(payload: dict[str, object]) -> dict[str, object]:
         scenario_type = str(payload.get("scenario_type", "link_down")).strip().lower()
@@ -2779,6 +2828,54 @@ def _build_mapping_suggestion_prompt(
         "3) 给出3条人工确认动作；\n"
         "4) 不要输出JSON。\n"
         f"\n输入：\n{json.dumps(compact, ensure_ascii=False)}"
+    )
+
+
+def _build_copilot_prompt(*, analysis: dict[str, Any], question: str, history: list[Any]) -> str:
+    compact = {
+        "resolved": analysis.get("resolved"),
+        "summary": analysis.get("summary"),
+        "topology_impact": analysis.get("topology_impact"),
+        "reasoning": analysis.get("reasoning"),
+        "narrative": analysis.get("narrative"),
+        "security_correlation": analysis.get("security_correlation"),
+        "tasks_top": (analysis.get("tasks") or [])[:8] if isinstance(analysis.get("tasks"), list) else [],
+        "history": history[-6:] if isinstance(history, list) else [],
+        "question": question,
+    }
+    return (
+        "你是网络故障分析副驾。请基于输入上下文回答用户追问。\n"
+        "要求：\n"
+        "1) 先给结论，再给依据；\n"
+        "2) 至少引用2条证据（指标/阈值/影响对象/任务状态）；\n"
+        "3) 若数据不足，明确指出缺失项；\n"
+        "4) 输出中文纯文本，不要JSON。\n"
+        f"\n上下文：\n{json.dumps(compact, ensure_ascii=False)}"
+    )
+
+
+def _copilot_references(*, analysis: dict[str, Any]) -> list[dict[str, Any]]:
+    summary = analysis.get("summary") if isinstance(analysis.get("summary"), dict) else {}
+    topo = analysis.get("topology_impact") if isinstance(analysis.get("topology_impact"), dict) else {}
+    refs: list[dict[str, Any]] = [
+        {"type": "summary", "key": "risk_level", "value": str(summary.get("risk_level") or "-")},
+        {"type": "summary", "key": "detected_alarm_total", "value": int(summary.get("detected_alarm_total") or 0)},
+        {"type": "impact", "key": "impacted_nodes", "value": len(topo.get("impacted_nodes") or [])},
+        {"type": "impact", "key": "impacted_links", "value": len(topo.get("impacted_links") or [])},
+    ]
+    return refs
+
+
+def _copilot_rule_fallback(*, analysis: dict[str, Any], question: str) -> str:
+    summary = analysis.get("summary") if isinstance(analysis.get("summary"), dict) else {}
+    topo = analysis.get("topology_impact") if isinstance(analysis.get("topology_impact"), dict) else {}
+    risk = str(summary.get("risk_level") or "unknown")
+    n = len(topo.get("impacted_nodes") or [])
+    l = len(topo.get("impacted_links") or [])
+    return (
+        f"当前无法调用AI服务，先给规则化答复。你问的是：{question}\n"
+        f"基于当前分析，风险等级为 {risk}，影响节点 {n} 个、影响链路 {l} 条。\n"
+        "建议先查看直接原因与阈值证据，再按高优先级任务链路逐项排查。"
     )
 
 

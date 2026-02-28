@@ -471,6 +471,10 @@ export function App() {
   const [analysisAiMeta, setAnalysisAiMeta] = useState(null);
   const [analysisAiLoading, setAnalysisAiLoading] = useState(false);
   const [analysisAiError, setAnalysisAiError] = useState('');
+  const [copilotQuestion, setCopilotQuestion] = useState('');
+  const [copilotHistory, setCopilotHistory] = useState([]);
+  const [copilotSessionId, setCopilotSessionId] = useState('');
+  const [copilotLoading, setCopilotLoading] = useState(false);
   const [replayMode, setReplayMode] = useState(false);
   const [showLayerPanel, setShowLayerPanel] = useState(false);
   const [showFaultPanel, setShowFaultPanel] = useState(false);
@@ -939,6 +943,9 @@ export function App() {
       setAnalysisAiReport('');
       setAnalysisAiMeta(null);
       setAnalysisAiError('');
+      setCopilotHistory([]);
+      setCopilotQuestion('');
+      setCopilotSessionId('');
       setFaultSpread(null);
       setTaskImpact(null);
       let analysisMode = 'auto';
@@ -1272,6 +1279,38 @@ export function App() {
       pushToast(msg, 'warn');
     } finally {
       setAnalysisLoading(false);
+    }
+  }
+
+  async function askCopilot() {
+    const q = String(copilotQuestion || '').trim();
+    if (!q || !taskImpact || !monitorClientRef.current) {
+      return;
+    }
+    try {
+      setCopilotLoading(true);
+      const resp = await monitorClientRef.current.analysisCopilot({
+        analysis: taskImpact,
+        session_id: copilotSessionId || undefined,
+        question: q,
+        history: copilotHistory.map((x) => ({ q: x.q, a: x.a }))
+      });
+      const sid = String(resp?.session_id || copilotSessionId || '');
+      if (sid) setCopilotSessionId(sid);
+      const row = {
+        q,
+        a: String(resp?.answer || '').trim(),
+        refs: Array.isArray(resp?.references) ? resp.references : [],
+        confidence: resp?.confidence || '-',
+        fallback: Boolean(resp?.fallback)
+      };
+      setCopilotHistory((prev) => [...prev, row].slice(-8));
+      setCopilotQuestion('');
+    } catch (err) {
+      const msg = err?.message || '追问失败';
+      pushToast(msg, 'warn');
+    } finally {
+      setCopilotLoading(false);
     }
   }
 
@@ -2872,6 +2911,27 @@ export function App() {
                       {analysisAiError ? <div className="analysis-error">{analysisAiError}</div> : null}
                       {analysisAiMeta?.source === 'fallback' ? <div>当前使用规则兜底报告：{analysisAiMeta?.fallbackReason || 'ollama unavailable'}</div> : null}
                       {analysisAiReport ? <div className="analysis-ai-report">{analysisAiReport}</div> : (!analysisAiLoading ? <div className="fault-empty">暂无AI报告</div> : null)}
+                    </div>
+                    <div className="analysis-block">
+                      <div><strong>追问式分析</strong>{copilotSessionId ? ` (${copilotSessionId})` : ''}</div>
+                      <div style={{ display: 'flex', gap: 6 }}>
+                        <input
+                          value={copilotQuestion}
+                          onChange={(e) => setCopilotQuestion(e.target.value)}
+                          placeholder="继续追问，例如：先恢复哪条链路？"
+                          style={{ flex: 1, minWidth: 0 }}
+                        />
+                        <button type="button" onClick={askCopilot} disabled={copilotLoading || !copilotQuestion.trim()}>{copilotLoading ? '回答中...' : '发送'}</button>
+                      </div>
+                      {copilotHistory.length === 0 ? <div className="fault-empty">暂无追问记录</div> : null}
+                      {copilotHistory.map((x, idx) => (
+                        <div key={`cp-${idx}`} className="analysis-ai-report">
+                          <div><strong>Q{idx + 1}</strong>: {x.q}</div>
+                          <div><strong>A{idx + 1}</strong>: {x.a || '-'}</div>
+                          <div>confidence: {x.confidence}{x.fallback ? ' (fallback)' : ''}</div>
+                          <div>refs: {Array.isArray(x.refs) ? x.refs.map((r) => `${r.type}.${r.key}=${r.value}`).join(' | ') : '-'}</div>
+                        </div>
+                      ))}
                     </div>
                   </aside>
                 ) : null}
