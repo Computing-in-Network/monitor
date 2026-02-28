@@ -1332,6 +1332,7 @@ def _ollama_base_urls() -> list[str]:
 def _ollama_generate(*, prompt: str, model: str) -> tuple[str, str, str, str]:
     timeout_sec = max(3, min(int(os.getenv("OLLAMA_TIMEOUT_SEC", "18")), 120))
     total_budget_sec = max(timeout_sec, min(int(os.getenv("OLLAMA_TOTAL_TIMEOUT_SEC", "35")), 180))
+    num_predict = max(128, min(int(os.getenv("OLLAMA_NUM_PREDICT", "360")), 2048))
     started_at = time.monotonic()
     last_err = "ollama request failed"
     fallback_models = [x.strip() for x in str(os.getenv("OLLAMA_FALLBACK_MODELS", "deepseek-r1:14b,qwen3:32b")).split(",") if x.strip()]
@@ -1352,7 +1353,7 @@ def _ollama_generate(*, prompt: str, model: str) -> tuple[str, str, str, str]:
                 "keep_alive": "20m",
                 "options": {
                     "temperature": 0.2,
-                    "num_predict": 720,
+                    "num_predict": num_predict,
                 },
             }
             req = urllib_request.Request(
@@ -1491,6 +1492,16 @@ def _build_ollama_analysis_prompt(
     impacted_nodes = topo.get("impacted_nodes") if isinstance(topo.get("impacted_nodes"), list) else []
     impacted_links = topo.get("impacted_links") if isinstance(topo.get("impacted_links"), list) else []
     findings_all = [x for x in (reasoning.get("top_findings") or []) if isinstance(x, dict)]
+    eb = evidence_bundle if isinstance(evidence_bundle, dict) else {}
+    eb_compact = {
+        "scope_observation_severity": eb.get("scope_observation_severity"),
+        "scope_observation_evidence": (eb.get("scope_observation_evidence") or [])[:6] if isinstance(eb.get("scope_observation_evidence"), list) else [],
+        "impacted_nodes_count": eb.get("impacted_nodes_count"),
+        "impacted_links_count": eb.get("impacted_links_count"),
+        "impacted_nodes_sample": (eb.get("impacted_nodes_sample") or [])[:12] if isinstance(eb.get("impacted_nodes_sample"), list) else [],
+        "impacted_links_sample": (eb.get("impacted_links_sample") or [])[:12] if isinstance(eb.get("impacted_links_sample"), list) else [],
+        "top_findings": (eb.get("top_findings") or [])[:6] if isinstance(eb.get("top_findings"), list) else [],
+    }
     compact = {
         "scope_type": scope_type,
         "scope_id": scope_id,
@@ -1507,26 +1518,21 @@ def _build_ollama_analysis_prompt(
         "note": reasoning.get("note"),
         "verdict": narrative.get("verdict"),
         "next_action": narrative.get("next_action"),
-        "tasks_top10": tasks[:10],
-        "evidence_bundle": evidence_bundle,
+        "tasks_top5": tasks[:5],
+        "evidence_bundle": eb_compact,
         "scope_observation": obs,
         "forecast_context": fc,
         "direct_reason_hint": extra_obj.get("direct_reason"),
-        "extra_context": extra_obj,
     }
     data_json = json.dumps(compact, ensure_ascii=False)
     return (
-        "你是网络故障管理专家。请基于输入数据写一份“可执行、可验证”的诊断报告。\n"
+        "你是网络故障管理专家。请基于输入数据写一份短报告（控制在220字内）。\n"
         "强约束：risk_result 是规则/LSTM给出的最终判级，AI不得改写、不得降级或升级该风险级别。\n"
         "要求：\n"
-        "1) 先给结论（沿用 risk_result 的风险级别+紧急程度）\n"
-        "2) 明确“直接原因”：必须写出命中的指标名、观测值、阈值、比较关系（例如 cpu=85.6% >= 82%）\n"
-        "3) 给出“证据链”：至少3条，优先使用 scope_observation 与 top_findings，不要泛泛而谈\n"
-        "4) 说明影响范围：影响节点数/链路数，并点名最多5个关键对象\n"
-        "5) 给出3条处置动作（P1/P2/P3），每条包含预期结果与验证方法\n"
-        "6) 给出“误报可能性评估”（低/中/高）和需要补采的关键指标\n"
-        "7) 若数据不足，明确写出“数据不足项”而不是编造原因\n"
-        "8) 输出中文纯文本，分段清晰，不要输出JSON。\n"
+        "1) 仅输出四行：结论、直接原因、影响范围、建议动作。\n"
+        "2) 直接原因必须含阈值比较（如 cpu=85.6%>=82%）。\n"
+        "3) 若证据不足，明确写“数据不足项：...”。\n"
+        "4) 输出中文纯文本，不要JSON，不要额外解释。\n"
         f"\n输入数据：\n{data_json}\n"
     )
 
@@ -2965,10 +2971,11 @@ def _build_copilot_prompt(*, analysis: dict[str, Any], question: str, history: l
     return (
         "你是网络故障分析副驾。请基于输入上下文回答用户追问。\n"
         "要求：\n"
-        "1) 先给结论，再给依据；\n"
-        "2) 至少引用2条证据（指标/阈值/影响对象/任务状态）；\n"
-        "3) 若数据不足，明确指出缺失项；\n"
-        "4) 输出中文纯文本，不要JSON。\n"
+        "1) 不超过180字；\n"
+        "2) 先结论，再证据；\n"
+        "3) 至少引用1条阈值/指标证据；\n"
+        "4) 数据不足时明确缺失项；\n"
+        "5) 输出中文纯文本，不要JSON。\n"
         f"\n上下文：\n{json.dumps(compact, ensure_ascii=False)}"
     )
 

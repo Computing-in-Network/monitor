@@ -1237,9 +1237,9 @@ export function App() {
           scope_observation: scopeObservation || {},
           forecast_context: forecastContext,
           security_correlation: overviewResult?.security_correlation || {},
-          impacted_nodes: spreadResult?.impacted_nodes || [],
-          impacted_links: spreadResult?.impacted_links || [],
-          tasks_top: Array.isArray(impactResult?.tasks) ? impactResult.tasks.slice(0, 8) : []
+          impacted_nodes: Array.isArray(spreadResult?.impacted_nodes) ? spreadResult.impacted_nodes.slice(0, 24) : [],
+          impacted_links: Array.isArray(spreadResult?.impacted_links) ? spreadResult.impacted_links.slice(0, 24) : [],
+          tasks_top: Array.isArray(impactResult?.tasks) ? impactResult.tasks.slice(0, 5) : []
         }
       }).then((explainResp) => {
         if (aiExplainSeqRef.current !== aiSeq) {
