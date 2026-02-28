@@ -1379,11 +1379,25 @@ def _newapi_generate(*, prompt: str, model: str) -> tuple[str, str, str, str]:
     api_key = str(os.getenv("GEMINI_API_KEY") or os.getenv("OPENAI_API_KEY") or "").strip()
     if not api_key:
         return "", "", "GEMINI_API_KEY/OPENAI_API_KEY not set", model
-    req_url = str(
+    raw_urls = str(os.getenv("AI_SERVER_URLS") or "").strip()
+    req_urls: list[str] = []
+    if raw_urls:
+        req_urls.extend([x.strip() for x in raw_urls.split(",") if x.strip()])
+    single_url = str(
         os.getenv("AI_SERVER_URL")
         or os.getenv("OPENAI_BASE_URL")
         or "http://192.168.0.5:3002/v1/chat/completions"
     ).strip()
+    if single_url:
+        req_urls.append(single_url)
+    dedup_urls: list[str] = []
+    seen_urls: set[str] = set()
+    for u in req_urls:
+        if u in seen_urls:
+            continue
+        seen_urls.add(u)
+        dedup_urls.append(u)
+    req_urls = dedup_urls or ["http://192.168.0.5:3002/v1/chat/completions"]
     timeout_sec = max(3, min(int(os.getenv("AI_TIMEOUT_SEC", os.getenv("GEMINI_TIMEOUT_SEC", "35"))), 180))
     max_tokens = max(128, min(int(os.getenv("AI_MAX_TOKENS", os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "1024"))), 4096))
     req_body = {
@@ -1399,13 +1413,14 @@ def _newapi_generate(*, prompt: str, model: str) -> tuple[str, str, str, str]:
         "max_completion_tokens": max_tokens,
         "max_output_tokens": max_tokens,
     }
-    def _post_once(body: dict[str, Any]) -> tuple[str, str]:
+    def _post_once(url: str, body: dict[str, Any]) -> tuple[str, str]:
         req = urllib_request.Request(
-            url=req_url,
+            url=url,
             data=json.dumps(body).encode("utf-8"),
             headers={
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {api_key}",
+                "x-api-key": api_key,
             },
             method="POST",
         )
@@ -1424,32 +1439,36 @@ def _newapi_generate(*, prompt: str, model: str) -> tuple[str, str, str, str]:
             return text, finish_reason
         return text, ""
 
-    try:
-        text, reason = _post_once(req_body)
-        likely_truncated = (
-            reason in {"length", "max_tokens"}
-            or ("**1." in text and "**2." in text and "**3." not in text)
-            or (text and text[-1] not in "。！？.!?】)}")
-        )
-        if likely_truncated:
-            retry_prompt = (
-                "请在300字内完整重写报告，必须包含并按顺序输出四段："
-                "结论、直接原因、影响范围、建议动作。每段1-2句。不要省略段名。\n\n"
-                f"{prompt}"
+    last_err = "newapi request failed"
+    for req_url in req_urls:
+        try:
+            text, reason = _post_once(req_url, req_body)
+            likely_truncated = (
+                reason in {"length", "max_tokens"}
+                or ("**1." in text and "**2." in text and "**3." not in text)
+                or (text and text[-1] not in "。！？.!?】)}")
             )
-            retry_body = dict(req_body)
-            retry_body["messages"] = [
-                {"role": "system", "content": "你是网络故障管理专家，输出要完整、紧凑、可读。"},
-                {"role": "user", "content": retry_prompt},
-            ]
-            retry_body["temperature"] = 0.1
-            text2, reason2 = _post_once(retry_body)
-            if text2:
-                return text2, req_url, "", model
-            return text, req_url, f"incomplete response ({reason or reason2})", model
-        return text, req_url, "", model
-    except (urllib_error.URLError, urllib_error.HTTPError, TimeoutError, json.JSONDecodeError) as exc:
-        return "", req_url, f"{type(exc).__name__}: {exc}", model
+            if likely_truncated:
+                retry_prompt = (
+                    "请在300字内完整重写报告，必须包含并按顺序输出四段："
+                    "结论、直接原因、影响范围、建议动作。每段1-2句。不要省略段名。\n\n"
+                    f"{prompt}"
+                )
+                retry_body = dict(req_body)
+                retry_body["messages"] = [
+                    {"role": "system", "content": "你是网络故障管理专家，输出要完整、紧凑、可读。"},
+                    {"role": "user", "content": retry_prompt},
+                ]
+                retry_body["temperature"] = 0.1
+                text2, reason2 = _post_once(req_url, retry_body)
+                if text2:
+                    return text2, req_url, "", model
+                return text, req_url, f"incomplete response ({reason or reason2})", model
+            return text, req_url, "", model
+        except (urllib_error.URLError, urllib_error.HTTPError, TimeoutError, json.JSONDecodeError) as exc:
+            last_err = f"{type(exc).__name__}: {exc} ({req_url})"
+            continue
+    return "", (req_urls[0] if req_urls else ""), last_err, model
 
 
 def _build_ollama_analysis_prompt(
