@@ -808,6 +808,57 @@ def create_app() -> FastAPI:
         finally:
             app.state.slo.record("analysis.global_impact", ok=ok, latency_ms=(time.perf_counter() - start) * 1000.0)
 
+    @app.post("/api/v1/normalization/suggest-mapping")
+    async def suggest_mapping(payload: dict[str, object]) -> dict[str, object]:
+        probe_type = str(payload.get("probe_type") or "").strip() or "unknown_probe"
+        raw_event_type = str(payload.get("raw_event_type") or "").strip() or "unknown_event"
+        sample = payload.get("sample")
+        if not isinstance(sample, dict) or not sample:
+            raise HTTPException(status_code=422, detail="sample(object) 为必填")
+
+        target_event_type = _infer_target_event_type(raw_event_type=raw_event_type, sample=sample)
+        mapping, unknown_fields = _suggest_mapping_rules(target_event_type=target_event_type, sample=sample)
+        confidence = _mapping_confidence(mapping=mapping, unknown_fields=unknown_fields)
+        manual_todo = _mapping_manual_todo(mapping=mapping, unknown_fields=unknown_fields, target_event_type=target_event_type)
+        ai_note = ""
+        ai_err = ""
+        provider = str(payload.get("provider") or os.getenv("AI_PROVIDER") or "newapi").strip().lower()
+        if provider not in {"newapi", "gemini", "ollama"}:
+            provider = "newapi"
+        if bool(payload.get("use_ai", True)):
+            model = str(
+                payload.get("model")
+                or (os.getenv("OLLAMA_MODEL") if provider == "ollama" else os.getenv("AI_MODEL_NAME") or os.getenv("GEMINI_MODEL"))
+                or "qwen3-coder:latest"
+            ).strip() or "qwen3-coder:latest"
+            prompt = _build_mapping_suggestion_prompt(
+                probe_type=probe_type,
+                raw_event_type=raw_event_type,
+                target_event_type=target_event_type,
+                sample=sample,
+                mapping=mapping,
+                unknown_fields=unknown_fields,
+                manual_todo=manual_todo,
+            )
+            if provider == "ollama":
+                text, _, err, _ = _ollama_generate(prompt=prompt, model=model)
+            else:
+                text, _, err, _ = _newapi_generate(prompt=prompt, model=model)
+            ai_note = str(text or "").strip()
+            ai_err = str(err or "").strip()
+        return {
+            "status": "ok",
+            "probe_type": probe_type,
+            "raw_event_type": raw_event_type,
+            "target_event_type": target_event_type,
+            "mapping": mapping,
+            "confidence": confidence,
+            "unknown_fields": unknown_fields,
+            "manual_todo": manual_todo,
+            "ai_note": ai_note,
+            "ai_error": ai_err,
+        }
+
     @app.post("/api/v1/bff/analysis/run")
     async def bff_analysis_run(payload: dict[str, object]) -> dict[str, object]:
         start = time.perf_counter()
@@ -2601,6 +2652,133 @@ def _build_simulation_report_prompt(
         "3) 关键拐点至少列出 3 条；\n"
         "4) 输出中文，简洁但信息完整。\n"
         f"\n输入：\n{json.dumps(compact, ensure_ascii=False)}\n"
+    )
+
+
+def _infer_target_event_type(*, raw_event_type: str, sample: dict[str, Any]) -> str:
+    t = str(raw_event_type or "").strip().lower()
+    if t in {"node_metric", "node-metric", "host", "node"}:
+        return "node_metric"
+    if t in {"link_metric", "link-metric", "interface", "net", "link"}:
+        return "link_metric"
+    if t in {"alarm", "alert"}:
+        return "alarm"
+    if t in {"flow", "flow_record"}:
+        return "flow"
+    keys = {str(k).strip().lower() for k in sample.keys()}
+    if {"src", "dst"} & keys:
+        return "link_metric"
+    if {"cpu_ratio", "cpu_percent", "mem_ratio", "mem_percent"} & keys:
+        return "node_metric"
+    if {"severity", "scope_type"} & keys:
+        return "alarm"
+    if "flow_id" in keys:
+        return "flow"
+    return "node_metric"
+
+
+def _suggest_mapping_rules(*, target_event_type: str, sample: dict[str, Any]) -> tuple[list[dict[str, Any]], list[str]]:
+    aliases: dict[str, list[str]] = {
+        "node_metric.node_uid": ["node_uid", "node_id", "docker_name", "host_id", "container_name"],
+        "node_metric.cpu_ratio": ["cpu_ratio", "cpu_used_ratio", "cpu_percent", "cpu"],
+        "node_metric.mem_ratio": ["mem_ratio", "mem_used_ratio", "mem_percent", "memory"],
+        "node_metric.status": ["status", "state"],
+        "link_metric.src_node_uid": ["src_node_uid", "src_node_id", "source", "src", "if_src"],
+        "link_metric.dst_node_uid": ["dst_node_uid", "dst_node_id", "target", "dst", "if_dst"],
+        "link_metric.link_uid": ["link_uid", "link_id"],
+        "link_metric.loss_rate": ["loss_rate", "loss", "if_loss"],
+        "link_metric.rtt_ms": ["rtt_ms", "latency_ms", "latency", "if_delay_ms"],
+        "link_metric.jitter_ms": ["jitter_ms", "jitter", "if_jitter_ms"],
+        "alarm.alarm_id": ["alarm_id", "id", "event_id"],
+        "alarm.severity": ["severity", "level"],
+        "alarm.scope_type": ["scope_type", "target_type"],
+        "alarm.scope_id": ["scope_id", "scope_uid", "target_id"],
+        "flow.flow_id": ["flow_id", "id", "session_id"],
+    }
+    required_fields: dict[str, list[str]] = {
+        "node_metric": ["node_uid", "cpu_ratio", "mem_ratio"],
+        "link_metric": ["src_node_uid", "dst_node_uid", "loss_rate", "rtt_ms"],
+        "alarm": ["alarm_id", "severity", "scope_type", "scope_id"],
+        "flow": ["flow_id"],
+    }
+    key_lc = {str(k).strip().lower(): str(k) for k in sample.keys()}
+    used_raw: set[str] = set()
+    rows: list[dict[str, Any]] = []
+    for req in required_fields.get(target_event_type, []):
+        alias_key = f"{target_event_type}.{req}"
+        cands = aliases.get(alias_key, [req])
+        chosen_raw = ""
+        chosen_val: Any = None
+        for c in cands:
+            if c in key_lc:
+                chosen_raw = key_lc[c]
+                chosen_val = sample.get(chosen_raw)
+                break
+        confidence = 0.95 if chosen_raw == req else 0.78 if chosen_raw else 0.0
+        reason = "exact_match" if chosen_raw == req else ("alias_match" if chosen_raw else "missing")
+        if chosen_raw:
+            used_raw.add(chosen_raw)
+        rows.append(
+            {
+                "target_field": req,
+                "source_field": chosen_raw or None,
+                "source_value_preview": str(chosen_val)[:120] if chosen_raw else None,
+                "confidence": round(confidence, 2),
+                "reason": reason,
+            }
+        )
+    unknown_fields = [str(k) for k in sample.keys() if str(k) not in used_raw]
+    return rows, sorted(unknown_fields)
+
+
+def _mapping_confidence(*, mapping: list[dict[str, Any]], unknown_fields: list[str]) -> dict[str, Any]:
+    if not mapping:
+        return {"score": 0.0, "level": "low"}
+    avg = sum(float(x.get("confidence") or 0.0) for x in mapping) / len(mapping)
+    penalty = min(0.25, 0.02 * len(unknown_fields))
+    score = max(0.0, min(1.0, avg - penalty))
+    level = "high" if score >= 0.8 else "medium" if score >= 0.55 else "low"
+    return {"score": round(score, 3), "level": level}
+
+
+def _mapping_manual_todo(*, mapping: list[dict[str, Any]], unknown_fields: list[str], target_event_type: str) -> list[str]:
+    out: list[str] = []
+    for row in mapping:
+        if not row.get("source_field"):
+            out.append(f"补齐必填字段 `{target_event_type}.{row.get('target_field')}` 的原始来源字段")
+    if unknown_fields:
+        out.append(f"确认未知字段用途并决定是否映射：{', '.join(unknown_fields[:8])}")
+    out.append("人工确认后再导出映射配置并生效")
+    return out
+
+
+def _build_mapping_suggestion_prompt(
+    *,
+    probe_type: str,
+    raw_event_type: str,
+    target_event_type: str,
+    sample: dict[str, Any],
+    mapping: list[dict[str, Any]],
+    unknown_fields: list[str],
+    manual_todo: list[str],
+) -> str:
+    compact = {
+        "probe_type": probe_type,
+        "raw_event_type": raw_event_type,
+        "target_event_type": target_event_type,
+        "sample_keys": sorted([str(k) for k in sample.keys()]),
+        "mapping": mapping,
+        "unknown_fields": unknown_fields,
+        "manual_todo": manual_todo,
+    }
+    return (
+        "你是探针字段映射专家，请给出简洁的中文建议。\n"
+        "输出要求：\n"
+        "1) 先判断当前映射是否可上线（可/不可）；\n"
+        "2) 列出3条主要风险；\n"
+        "3) 给出3条人工确认动作；\n"
+        "4) 不要输出JSON。\n"
+        f"\n输入：\n{json.dumps(compact, ensure_ascii=False)}"
     )
 
 
