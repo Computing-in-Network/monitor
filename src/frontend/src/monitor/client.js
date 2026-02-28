@@ -108,7 +108,14 @@ export class MonitorApiClient {
       data = {};
     }
     if (!res.ok || data.status === 'error') {
-      throw new MonitorApiError(data.error_message || data.message || `HTTP ${res.status}`, {
+      const detail = data?.detail;
+      const detailMsg = typeof detail === 'string'
+        ? detail
+        : (detail && typeof detail === 'object'
+          ? (detail.message || detail.error || detail.reason || '')
+          : '');
+      const msg = data.error_message || data.message || detailMsg || `HTTP ${res.status}`;
+      throw new MonitorApiError(msg, {
         code: data.error_code || data.code || MONITOR_ERROR_CODE.INVALID_PAYLOAD,
         status: res.status,
         payload: data
@@ -390,6 +397,16 @@ export class MonitorApiClient {
     }
   }
 
+  async analyzeExplain(payload, options = {}) {
+    const { data } = await this._request('/api/v1/bff/analysis/explain', {
+      method: 'POST',
+      json: true,
+      body: JSON.stringify(payload || {}),
+      token: options.token
+    });
+    return data;
+  }
+
   async analyzeGlobalImpact(payload, options = {}) {
     const { data } = await this._request('/api/v1/bff/analysis/global-impact', {
       method: 'POST',
@@ -423,6 +440,16 @@ export class MonitorApiClient {
   async getSimulationTimeline(simulationId, options = {}) {
     const { data } = await this._request(`/api/v1/bff/simulation/${encodeURIComponent(simulationId)}/timeline`, {
       method: 'GET',
+      token: options.token
+    });
+    return data;
+  }
+
+  async createSimulationReport(simulationId, payload = {}, options = {}) {
+    const { data } = await this._request(`/api/v1/bff/simulation/${encodeURIComponent(simulationId)}/report`, {
+      method: 'POST',
+      json: true,
+      body: JSON.stringify(payload || {}),
       token: options.token
     });
     return data;
