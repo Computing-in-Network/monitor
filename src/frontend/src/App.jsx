@@ -2803,6 +2803,9 @@ export function App() {
                         <div><strong>Topology Impact</strong></div>
                         <div>seeds: {faultSpread.seed_nodes?.length ?? 0}, impacted_nodes: {faultSpread.impacted_nodes?.length ?? 0}</div>
                         <div>impacted_links: {faultSpread.impacted_links?.length ?? 0}, boundary: {faultSpread.boundary_nodes?.length ?? 0}</div>
+                        <div>route_mode: {taskImpact?.topology_impact?.route_mode || '-'}, policy: {taskImpact?.topology_impact?.policy || '-'}</div>
+                        <div>rank_top: {Array.isArray(taskImpact?.topology_impact?.rank_top) ? taskImpact.topology_impact.rank_top.slice(0, 3).map((x) => `${x.link_id}(${Number(x.score || 0).toFixed(1)})`).join(' | ') : '-'}</div>
+                        <div>filtered_out: {Array.isArray(taskImpact?.topology_impact?.filtered_out) ? taskImpact.topology_impact.filtered_out.length : 0}</div>
                       </div>
                     ) : null}
                     {directReasonText ? (
