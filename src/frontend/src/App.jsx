@@ -142,6 +142,21 @@ function svgDataUri(svg) {
   return `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(svg)}`;
 }
 
+function isFiniteNumber(v) {
+  return Number.isFinite(Number(v));
+}
+
+function safeFromDegrees(lon, lat, alt = 0) {
+  if (!isFiniteNumber(lon) || !isFiniteNumber(lat) || !isFiniteNumber(alt)) {
+    return null;
+  }
+  return Cartesian3.fromDegrees(Number(lon), Number(lat), Number(alt));
+}
+
+function hasValidGeo(node) {
+  return Boolean(node) && isFiniteNumber(node.lon) && isFiniteNumber(node.lat) && isFiniteNumber(node.alt_m);
+}
+
 function buildNodeIcon(type) {
   if (type === 'leo') {
     return svgDataUri(`
@@ -189,11 +204,14 @@ const nodeIcon = {
 };
 
 function toCartesian(node) {
-  return Cartesian3.fromDegrees(node.lon, node.lat, node.alt_m);
+  return safeFromDegrees(node?.lon, node?.lat, node?.alt_m);
 }
 
 function buildSatelliteOrbitPolyline(node) {
   if (node.type !== 'leo' || node.vx == null || node.vy == null || node.vz == null) {
+    return null;
+  }
+  if (!isFiniteNumber(node.x) || !isFiniteNumber(node.y) || !isFiniteNumber(node.z)) {
     return null;
   }
   const r = new Cartesian3(node.x, node.y, node.z);
@@ -762,12 +780,16 @@ export function App() {
         return;
       }
       const node = nodeStateRef.current.get(nodeId);
-      if (!node) {
+      if (!node || !hasValidGeo(node)) {
         return;
       }
       setSelected({ kind: 'node', id: nodeId });
+      const destination = safeFromDegrees(node.lon, node.lat, Number(node.alt_m) + 1_200_000);
+      if (!destination) {
+        return;
+      }
       viewer.camera.flyTo({
-        destination: Cartesian3.fromDegrees(node.lon, node.lat, node.alt_m + 1_200_000),
+        destination,
         duration: 0.8
       });
       return;
@@ -779,7 +801,7 @@ export function App() {
     }
     const aNode = nodeStateRef.current.get(a);
     const bNode = nodeStateRef.current.get(b);
-    if (!aNode || !bNode) {
+    if (!aNode || !bNode || !hasValidGeo(aNode) || !hasValidGeo(bNode)) {
       return;
     }
     const linkIdAB = `${a}-${b}`;
@@ -791,12 +813,16 @@ export function App() {
     if (linkStateRef.current.has(linkId)) {
       setSelected({ kind: 'link', id: linkId });
     }
+    const destination = safeFromDegrees(
+      (Number(aNode.lon) + Number(bNode.lon)) / 2.0,
+      (Number(aNode.lat) + Number(bNode.lat)) / 2.0,
+      Math.max(Number(aNode.alt_m), Number(bNode.alt_m)) + 1_200_000
+    );
+    if (!destination) {
+      return;
+    }
     viewer.camera.flyTo({
-      destination: Cartesian3.fromDegrees(
-        (aNode.lon + bNode.lon) / 2.0,
-        (aNode.lat + bNode.lat) / 2.0,
-        Math.max(aNode.alt_m, bNode.alt_m) + 1_200_000
-      ),
+      destination,
       duration: 0.8
     });
   }
@@ -808,7 +834,7 @@ export function App() {
     }
     const aNode = nodeStateRef.current.get(a);
     const bNode = nodeStateRef.current.get(b);
-    if (!aNode || !bNode) {
+    if (!aNode || !bNode || !hasValidGeo(aNode) || !hasValidGeo(bNode)) {
       return false;
     }
     const linkIdAB = `${a}-${b}`;
@@ -820,12 +846,16 @@ export function App() {
     if (linkStateRef.current.has(linkId)) {
       setSelected({ kind: 'link', id: linkId });
     }
+    const destination = safeFromDegrees(
+      (Number(aNode.lon) + Number(bNode.lon)) / 2.0,
+      (Number(aNode.lat) + Number(bNode.lat)) / 2.0,
+      Math.max(Number(aNode.alt_m), Number(bNode.alt_m)) + 1_200_000
+    );
+    if (!destination) {
+      return false;
+    }
     viewer.camera.flyTo({
-      destination: Cartesian3.fromDegrees(
-        (aNode.lon + bNode.lon) / 2.0,
-        (aNode.lat + bNode.lat) / 2.0,
-        Math.max(aNode.alt_m, bNode.alt_m) + 1_200_000
-      ),
+      destination,
       duration: 0.8
     });
     return true;
@@ -854,15 +884,22 @@ export function App() {
       const topoNodeId = resolveTopoNodeId(lookup);
       const node = topoNodeId ? nodeStateRef.current.get(topoNodeId) : null;
       const viewer = viewerRef.current;
-      if (!node || !viewer) {
+      if (!node || !viewer || !hasValidGeo(node)) {
         const msg = `定位失败：当前拓扑中找不到节点 ${lookup || '-'}`;
         setMonitorActionStatus(msg);
         pushToast(msg, 'warn');
         return;
       }
       setSelected({ kind: 'node', id: node.id });
+      const destination = safeFromDegrees(node.lon, node.lat, Number(node.alt_m) + 1_200_000);
+      if (!destination) {
+        const msg = `定位失败：节点 ${node.id} 坐标异常`;
+        setMonitorActionStatus(msg);
+        pushToast(msg, 'warn');
+        return;
+      }
       viewer.camera.flyTo({
-        destination: Cartesian3.fromDegrees(node.lon, node.lat, node.alt_m + 1_200_000),
+        destination,
         duration: 0.8
       });
       setMonitorActionStatus(`已定位节点 ${node.id}`);
@@ -894,9 +931,13 @@ export function App() {
       setSelected({ kind: 'node', id: candidate.scopeId });
       const viewer = viewerRef.current;
       const node = nodeStateRef.current.get(candidate.scopeId);
-      if (viewer && node) {
+      if (viewer && node && hasValidGeo(node)) {
+        const destination = safeFromDegrees(node.lon, node.lat, Number(node.alt_m) + 1_200_000);
+        if (!destination) {
+          return;
+        }
         viewer.camera.flyTo({
-          destination: Cartesian3.fromDegrees(node.lon, node.lat, node.alt_m + 1_200_000),
+          destination,
           duration: 0.8
         });
       }
@@ -1237,9 +1278,9 @@ export function App() {
           scope_observation: scopeObservation || {},
           forecast_context: forecastContext,
           security_correlation: overviewResult?.security_correlation || {},
-          impacted_nodes: spreadResult?.impacted_nodes || [],
-          impacted_links: spreadResult?.impacted_links || [],
-          tasks_top: Array.isArray(impactResult?.tasks) ? impactResult.tasks.slice(0, 8) : []
+          impacted_nodes: Array.isArray(spreadResult?.impacted_nodes) ? spreadResult.impacted_nodes.slice(0, 24) : [],
+          impacted_links: Array.isArray(spreadResult?.impacted_links) ? spreadResult.impacted_links.slice(0, 24) : [],
+          tasks_top: Array.isArray(impactResult?.tasks) ? impactResult.tasks.slice(0, 5) : []
         }
       }).then((explainResp) => {
         if (aiExplainSeqRef.current !== aiSeq) {
@@ -1284,13 +1325,20 @@ export function App() {
 
   async function askCopilot() {
     const q = String(copilotQuestion || '').trim();
-    if (!q || !taskImpact || !monitorClientRef.current) {
+    if (!q || !monitorClientRef.current) {
+      return;
+    }
+    const analysisPayload = taskImpact || analysisOverview;
+    if (!analysisPayload) {
+      const msg = '请先点击“运行分析”再追问';
+      setMonitorActionStatus(msg);
+      pushToast(msg, 'warn');
       return;
     }
     try {
       setCopilotLoading(true);
       const resp = await monitorClientRef.current.analysisCopilot({
-        analysis: taskImpact,
+        analysis: analysisPayload,
         session_id: copilotSessionId || undefined,
         question: q,
         history: copilotHistory.map((x) => ({ q: x.q, a: x.a }))
@@ -1675,6 +1723,10 @@ export function App() {
     for (const node of frame.nodes) {
       activeNodeIds.add(node.id);
       const position = toCartesian(node);
+      if (!position) {
+        nodeVisibilityRef.current.set(node.id, false);
+        continue;
+      }
       nodePositionMap.set(node.id, position);
       const color = typeColor[node.type] || Color.WHITE;
       const nodeVisible = isNodeVisible(node, layerPrefs);
@@ -2359,6 +2411,16 @@ export function App() {
   const ruleRiskResult = (taskImpact && typeof taskImpact.risk_result === 'object') ? taskImpact.risk_result : null;
   const evidenceBundle = (taskImpact && typeof taskImpact.evidence_bundle === 'object') ? taskImpact.evidence_bundle : null;
   const displayRiskLevel = String(ruleRiskResult?.risk_level || taskImpact?.summary?.risk_level || taskImpact?.risk_level || '-');
+  const displayDecision = String(ruleRiskResult?.decision || 'unknown');
+  const displayDecisionText = (
+    displayDecision === 'confirmed_fault'
+      ? '已确认故障'
+      : displayDecision === 'suspected_anomaly'
+        ? '疑似异常（待确认）'
+        : displayDecision === 'normal'
+          ? '当前正常'
+          : '-'
+  );
   const displayDirectReason = String(ruleRiskResult?.direct_reason || directReasonText || '').trim();
   const evidenceFindings = Array.isArray(evidenceBundle?.top_findings) ? evidenceBundle.top_findings : [];
   const evidenceAlarms = Array.isArray(evidenceBundle?.detected_alarms) ? evidenceBundle.detected_alarms : [];
@@ -2625,7 +2687,7 @@ export function App() {
           <div>type: {hoverInfo.node.category}</div>
           <div>orbit: {hoverInfo.node.orbit_class || '-'}</div>
           <div>links: {hoverInfo.node.has_link ? `yes (degree ${hoverInfo.node.degree})` : 'no'}</div>
-          <div>alt: {hoverInfo.node.alt_m.toFixed(0)} m</div>
+          <div>alt: {isFiniteNumber(hoverInfo.node.alt_m) ? `${Number(hoverInfo.node.alt_m).toFixed(0)} m` : '--'}</div>
           <div>cpu: {hoverNodeMetric?.cpuRatio != null ? `${(hoverNodeMetric.cpuRatio * 100).toFixed(1)}%` : '--'}</div>
           <div>mem: {hoverNodeMetric?.memRatio != null ? `${(hoverNodeMetric.memRatio * 100).toFixed(1)}%` : '--'}</div>
         </div>
@@ -2656,9 +2718,9 @@ export function App() {
             <div>id: {selectedNode.id}</div>
             <div>类别: {selectedNode.category}</div>
             <div>轨道: {selectedNode.orbit_class || '-'}</div>
-            <div>纬度: {selectedNode.lat.toFixed(3)}</div>
-            <div>经度: {selectedNode.lon.toFixed(3)}</div>
-            <div>高度: {selectedNode.alt_m.toFixed(0)} m</div>
+            <div>纬度: {isFiniteNumber(selectedNode.lat) ? Number(selectedNode.lat).toFixed(3) : '--'}</div>
+            <div>经度: {isFiniteNumber(selectedNode.lon) ? Number(selectedNode.lon).toFixed(3) : '--'}</div>
+            <div>高度: {isFiniteNumber(selectedNode.alt_m) ? `${Number(selectedNode.alt_m).toFixed(0)} m` : '--'}</div>
             <div>连通: {selectedNode.has_link ? `是（度 ${selectedNode.degree}）` : '否'}</div>
             <div>docker: {selectedNodeMetric?.dockerName || '-'}</div>
             <div>docker ip: {selectedNodeMetric?.dockerIp || '-'}</div>
@@ -2709,8 +2771,8 @@ export function App() {
             <div>B: {selectedLink.b.name} ({selectedLink.b.id})</div>
             <div>A 类别: {selectedLink.a.category}</div>
             <div>B 类别: {selectedLink.b.category}</div>
-            <div>A 高度: {selectedLink.a.alt_m.toFixed(0)} m</div>
-            <div>B 高度: {selectedLink.b.alt_m.toFixed(0)} m</div>
+            <div>A 高度: {isFiniteNumber(selectedLink.a.alt_m) ? `${Number(selectedLink.a.alt_m).toFixed(0)} m` : '--'}</div>
+            <div>B 高度: {isFiniteNumber(selectedLink.b.alt_m) ? `${Number(selectedLink.b.alt_m).toFixed(0)} m` : '--'}</div>
             <div>link uid: {selectedLinkMetric?.linkUid || '-'}</div>
             <div>match key: {selectedLinkMetricKey || '-'}</div>
             <div>monitor health: {selectedLinkMetric?.health || '-'}</div>
@@ -2877,6 +2939,7 @@ export function App() {
                     </div>
                     <div className="analysis-block">
                       <div><strong>风险预警（规则/LSTM）</strong></div>
+                      <div>故障判定: {displayDecisionText}</div>
                       <div>risk: {displayRiskLevel}</div>
                       <div>source: {ruleRiskResult?.source || 'rules_lstm'}</div>
                       <div>max_severity: {ruleRiskResult?.max_alarm_severity || taskImpact?.summary?.max_alarm_severity || '-'}</div>
@@ -2890,6 +2953,8 @@ export function App() {
                       <div>impacted_links: {evidenceBundle?.impacted_links_count ?? (faultSpread?.impacted_links?.length ?? 0)}</div>
                       <div>top_findings: {evidenceFindings.length}</div>
                       <div>detected_alarms: {evidenceAlarms.length}</div>
+                      <div>observation_severity: {evidenceBundle?.scope_observation_severity || '-'}</div>
+                      <div>observation_evidence: {Array.isArray(evidenceBundle?.scope_observation_evidence) && evidenceBundle.scope_observation_evidence.length > 0 ? evidenceBundle.scope_observation_evidence.join(' | ') : '-'}</div>
                       <div>tasks_top: {evidenceTasks.length}</div>
                       <div>route_mode: {taskImpact?.topology_impact?.route_mode || '-'}, policy: {taskImpact?.topology_impact?.policy || '-'}</div>
                       <div>security_level: {evidenceBundle?.security_correlation?.level || taskImpact?.security_correlation?.level || 'none'}</div>

@@ -1001,17 +1001,36 @@ def create_app() -> FastAPI:
                 str(x) for x in (primary_finding.get("evidence") or [])
                 if str(x).strip()
             ]
+            scope_observation = payload.get("scope_observation") if isinstance(payload.get("scope_observation"), dict) else {}
+            obs_severity = _infer_scope_severity_from_observation(scope_type, scope_observation)
+            obs_evidence = _observation_evidence(scope_type=scope_type, observation=scope_observation)
+            alarm_total = int((out.get("summary") or {}).get("detected_alarm_total") or 0)
+            has_structured_finding = bool(findings)
+            if alarm_total > 0 or has_structured_finding:
+                decision = "confirmed_fault"
+            elif _severity_rank(obs_severity) >= _severity_rank("warning"):
+                decision = "suspected_anomaly"
+            else:
+                decision = "normal"
+            risk_level = str((out.get("summary") or {}).get("risk_level") or "normal").strip().lower() or "normal"
+            if decision == "normal":
+                risk_level = "normal"
+            elif risk_level == "normal" and _severity_rank(obs_severity) >= _severity_rank("warning"):
+                risk_level = obs_severity
             out["risk_result"] = {
                 "source": "rules_lstm",
-                "risk_level": (out.get("summary") or {}).get("risk_level"),
+                "risk_level": risk_level,
                 "max_alarm_severity": (out.get("summary") or {}).get("max_alarm_severity"),
                 "focused_scope_severity": (out.get("summary") or {}).get("focused_scope_severity"),
                 "detected_alarm_total": (out.get("summary") or {}).get("detected_alarm_total"),
-                "direct_reason": "、".join(primary_evidence[:3]) if primary_evidence else None,
+                "decision": decision,
+                "direct_reason": "、".join(primary_evidence[:3]) if primary_evidence else ("、".join(obs_evidence[:3]) if obs_evidence else None),
                 "primary_finding": primary_finding or None,
             }
             out["evidence_bundle"] = {
-                "scope_observation": payload.get("scope_observation") if isinstance(payload.get("scope_observation"), dict) else {},
+                "scope_observation": scope_observation,
+                "scope_observation_severity": obs_severity,
+                "scope_observation_evidence": obs_evidence,
                 "top_findings": findings,
                 "detected_alarms": [
                     x for x in (result.get("detected_alarms") or [])
@@ -1313,6 +1332,7 @@ def _ollama_base_urls() -> list[str]:
 def _ollama_generate(*, prompt: str, model: str) -> tuple[str, str, str, str]:
     timeout_sec = max(3, min(int(os.getenv("OLLAMA_TIMEOUT_SEC", "18")), 120))
     total_budget_sec = max(timeout_sec, min(int(os.getenv("OLLAMA_TOTAL_TIMEOUT_SEC", "35")), 180))
+    num_predict = max(128, min(int(os.getenv("OLLAMA_NUM_PREDICT", "360")), 2048))
     started_at = time.monotonic()
     last_err = "ollama request failed"
     fallback_models = [x.strip() for x in str(os.getenv("OLLAMA_FALLBACK_MODELS", "deepseek-r1:14b,qwen3:32b")).split(",") if x.strip()]
@@ -1333,7 +1353,7 @@ def _ollama_generate(*, prompt: str, model: str) -> tuple[str, str, str, str]:
                 "keep_alive": "20m",
                 "options": {
                     "temperature": 0.2,
-                    "num_predict": 720,
+                    "num_predict": num_predict,
                 },
             }
             req = urllib_request.Request(
@@ -1360,11 +1380,25 @@ def _newapi_generate(*, prompt: str, model: str) -> tuple[str, str, str, str]:
     api_key = str(os.getenv("GEMINI_API_KEY") or os.getenv("OPENAI_API_KEY") or "").strip()
     if not api_key:
         return "", "", "GEMINI_API_KEY/OPENAI_API_KEY not set", model
-    req_url = str(
+    raw_urls = str(os.getenv("AI_SERVER_URLS") or "").strip()
+    req_urls: list[str] = []
+    if raw_urls:
+        req_urls.extend([x.strip() for x in raw_urls.split(",") if x.strip()])
+    single_url = str(
         os.getenv("AI_SERVER_URL")
         or os.getenv("OPENAI_BASE_URL")
         or "http://192.168.0.5:3002/v1/chat/completions"
     ).strip()
+    if single_url:
+        req_urls.append(single_url)
+    dedup_urls: list[str] = []
+    seen_urls: set[str] = set()
+    for u in req_urls:
+        if u in seen_urls:
+            continue
+        seen_urls.add(u)
+        dedup_urls.append(u)
+    req_urls = dedup_urls or ["http://192.168.0.5:3002/v1/chat/completions"]
     timeout_sec = max(3, min(int(os.getenv("AI_TIMEOUT_SEC", os.getenv("GEMINI_TIMEOUT_SEC", "35"))), 180))
     max_tokens = max(128, min(int(os.getenv("AI_MAX_TOKENS", os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "1024"))), 4096))
     req_body = {
@@ -1380,13 +1414,14 @@ def _newapi_generate(*, prompt: str, model: str) -> tuple[str, str, str, str]:
         "max_completion_tokens": max_tokens,
         "max_output_tokens": max_tokens,
     }
-    def _post_once(body: dict[str, Any]) -> tuple[str, str]:
+    def _post_once(url: str, body: dict[str, Any]) -> tuple[str, str]:
         req = urllib_request.Request(
-            url=req_url,
+            url=url,
             data=json.dumps(body).encode("utf-8"),
             headers={
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {api_key}",
+                "x-api-key": api_key,
             },
             method="POST",
         )
@@ -1405,32 +1440,36 @@ def _newapi_generate(*, prompt: str, model: str) -> tuple[str, str, str, str]:
             return text, finish_reason
         return text, ""
 
-    try:
-        text, reason = _post_once(req_body)
-        likely_truncated = (
-            reason in {"length", "max_tokens"}
-            or ("**1." in text and "**2." in text and "**3." not in text)
-            or (text and text[-1] not in "。！？.!?】)}")
-        )
-        if likely_truncated:
-            retry_prompt = (
-                "请在300字内完整重写报告，必须包含并按顺序输出四段："
-                "结论、直接原因、影响范围、建议动作。每段1-2句。不要省略段名。\n\n"
-                f"{prompt}"
+    last_err = "newapi request failed"
+    for req_url in req_urls:
+        try:
+            text, reason = _post_once(req_url, req_body)
+            likely_truncated = (
+                reason in {"length", "max_tokens"}
+                or ("**1." in text and "**2." in text and "**3." not in text)
+                or (text and text[-1] not in "。！？.!?】)}")
             )
-            retry_body = dict(req_body)
-            retry_body["messages"] = [
-                {"role": "system", "content": "你是网络故障管理专家，输出要完整、紧凑、可读。"},
-                {"role": "user", "content": retry_prompt},
-            ]
-            retry_body["temperature"] = 0.1
-            text2, reason2 = _post_once(retry_body)
-            if text2:
-                return text2, req_url, "", model
-            return text, req_url, f"incomplete response ({reason or reason2})", model
-        return text, req_url, "", model
-    except (urllib_error.URLError, urllib_error.HTTPError, TimeoutError, json.JSONDecodeError) as exc:
-        return "", req_url, f"{type(exc).__name__}: {exc}", model
+            if likely_truncated:
+                retry_prompt = (
+                    "请在300字内完整重写报告，必须包含并按顺序输出四段："
+                    "结论、直接原因、影响范围、建议动作。每段1-2句。不要省略段名。\n\n"
+                    f"{prompt}"
+                )
+                retry_body = dict(req_body)
+                retry_body["messages"] = [
+                    {"role": "system", "content": "你是网络故障管理专家，输出要完整、紧凑、可读。"},
+                    {"role": "user", "content": retry_prompt},
+                ]
+                retry_body["temperature"] = 0.1
+                text2, reason2 = _post_once(req_url, retry_body)
+                if text2:
+                    return text2, req_url, "", model
+                return text, req_url, f"incomplete response ({reason or reason2})", model
+            return text, req_url, "", model
+        except (urllib_error.URLError, urllib_error.HTTPError, TimeoutError, json.JSONDecodeError) as exc:
+            last_err = f"{type(exc).__name__}: {exc} ({req_url})"
+            continue
+    return "", (req_urls[0] if req_urls else ""), last_err, model
 
 
 def _build_ollama_analysis_prompt(
@@ -1453,6 +1492,16 @@ def _build_ollama_analysis_prompt(
     impacted_nodes = topo.get("impacted_nodes") if isinstance(topo.get("impacted_nodes"), list) else []
     impacted_links = topo.get("impacted_links") if isinstance(topo.get("impacted_links"), list) else []
     findings_all = [x for x in (reasoning.get("top_findings") or []) if isinstance(x, dict)]
+    eb = evidence_bundle if isinstance(evidence_bundle, dict) else {}
+    eb_compact = {
+        "scope_observation_severity": eb.get("scope_observation_severity"),
+        "scope_observation_evidence": (eb.get("scope_observation_evidence") or [])[:6] if isinstance(eb.get("scope_observation_evidence"), list) else [],
+        "impacted_nodes_count": eb.get("impacted_nodes_count"),
+        "impacted_links_count": eb.get("impacted_links_count"),
+        "impacted_nodes_sample": (eb.get("impacted_nodes_sample") or [])[:12] if isinstance(eb.get("impacted_nodes_sample"), list) else [],
+        "impacted_links_sample": (eb.get("impacted_links_sample") or [])[:12] if isinstance(eb.get("impacted_links_sample"), list) else [],
+        "top_findings": (eb.get("top_findings") or [])[:6] if isinstance(eb.get("top_findings"), list) else [],
+    }
     compact = {
         "scope_type": scope_type,
         "scope_id": scope_id,
@@ -1469,26 +1518,21 @@ def _build_ollama_analysis_prompt(
         "note": reasoning.get("note"),
         "verdict": narrative.get("verdict"),
         "next_action": narrative.get("next_action"),
-        "tasks_top10": tasks[:10],
-        "evidence_bundle": evidence_bundle,
+        "tasks_top5": tasks[:5],
+        "evidence_bundle": eb_compact,
         "scope_observation": obs,
         "forecast_context": fc,
         "direct_reason_hint": extra_obj.get("direct_reason"),
-        "extra_context": extra_obj,
     }
     data_json = json.dumps(compact, ensure_ascii=False)
     return (
-        "你是网络故障管理专家。请基于输入数据写一份“可执行、可验证”的诊断报告。\n"
+        "你是网络故障管理专家。请基于输入数据写一份短报告（控制在220字内）。\n"
         "强约束：risk_result 是规则/LSTM给出的最终判级，AI不得改写、不得降级或升级该风险级别。\n"
         "要求：\n"
-        "1) 先给结论（沿用 risk_result 的风险级别+紧急程度）\n"
-        "2) 明确“直接原因”：必须写出命中的指标名、观测值、阈值、比较关系（例如 cpu=85.6% >= 82%）\n"
-        "3) 给出“证据链”：至少3条，优先使用 scope_observation 与 top_findings，不要泛泛而谈\n"
-        "4) 说明影响范围：影响节点数/链路数，并点名最多5个关键对象\n"
-        "5) 给出3条处置动作（P1/P2/P3），每条包含预期结果与验证方法\n"
-        "6) 给出“误报可能性评估”（低/中/高）和需要补采的关键指标\n"
-        "7) 若数据不足，明确写出“数据不足项”而不是编造原因\n"
-        "8) 输出中文纯文本，分段清晰，不要输出JSON。\n"
+        "1) 仅输出四行：结论、直接原因、影响范围、建议动作。\n"
+        "2) 直接原因必须含阈值比较（如 cpu=85.6%>=82%）。\n"
+        "3) 若证据不足，明确写“数据不足项：...”。\n"
+        "4) 输出中文纯文本，不要JSON，不要额外解释。\n"
         f"\n输入数据：\n{data_json}\n"
     )
 
@@ -2185,6 +2229,48 @@ def _infer_scope_severity_from_observation(scope_type: str, observation: dict[st
     return "info"
 
 
+def _observation_evidence(*, scope_type: str, observation: dict[str, Any]) -> list[str]:
+    st = str(scope_type or "").strip().lower()
+    if not isinstance(observation, dict):
+        return []
+    if st == "node":
+        cpu = _safe_float(observation.get("cpu_ratio"))
+        mem = _safe_float(observation.get("mem_ratio"))
+        status = str(observation.get("status") or "").strip().upper()
+        out: list[str] = []
+        if cpu >= 0.92:
+            out.append(f"cpu_ratio={cpu:.3f}>=0.92")
+        elif cpu >= 0.82:
+            out.append(f"cpu_ratio={cpu:.3f}>=0.82")
+        if mem >= 0.92:
+            out.append(f"mem_ratio={mem:.3f}>=0.92")
+        elif mem >= 0.82:
+            out.append(f"mem_ratio={mem:.3f}>=0.82")
+        if status and status != "UP":
+            out.append(f"status={status}")
+        return out
+    if st == "link":
+        loss = _safe_float(observation.get("loss_rate"))
+        rtt = _safe_float(observation.get("rtt_ms"))
+        jitter = _safe_float(observation.get("jitter_ms"))
+        state = str(observation.get("state") or "").strip().upper()
+        out = []
+        if loss >= 0.06:
+            out.append(f"loss_rate={loss:.3f}>=0.06")
+        elif loss >= 0.03:
+            out.append(f"loss_rate={loss:.3f}>=0.03")
+        if rtt >= 280:
+            out.append(f"rtt_ms={rtt:.1f}>=280")
+        elif rtt >= 180:
+            out.append(f"rtt_ms={rtt:.1f}>=180")
+        if jitter >= 35:
+            out.append(f"jitter_ms={jitter:.1f}>=35")
+        if state in {"DOWN", "DISCONNECTED", "DEGRADED"}:
+            out.append(f"state={state}")
+        return out
+    return []
+
+
 def _shortest_path_nodes(graph: dict[str, set[str]], src: str, dst: str) -> list[str]:
     if src == dst:
         return [src]
@@ -2871,6 +2957,8 @@ def _build_mapping_suggestion_prompt(
 def _build_copilot_prompt(*, analysis: dict[str, Any], question: str, history: list[Any]) -> str:
     compact = {
         "resolved": analysis.get("resolved"),
+        "risk_result": analysis.get("risk_result"),
+        "evidence_bundle": analysis.get("evidence_bundle"),
         "summary": analysis.get("summary"),
         "topology_impact": analysis.get("topology_impact"),
         "reasoning": analysis.get("reasoning"),
@@ -2883,19 +2971,22 @@ def _build_copilot_prompt(*, analysis: dict[str, Any], question: str, history: l
     return (
         "你是网络故障分析副驾。请基于输入上下文回答用户追问。\n"
         "要求：\n"
-        "1) 先给结论，再给依据；\n"
-        "2) 至少引用2条证据（指标/阈值/影响对象/任务状态）；\n"
-        "3) 若数据不足，明确指出缺失项；\n"
-        "4) 输出中文纯文本，不要JSON。\n"
+        "1) 不超过180字；\n"
+        "2) 先结论，再证据；\n"
+        "3) 至少引用1条阈值/指标证据；\n"
+        "4) 数据不足时明确缺失项；\n"
+        "5) 输出中文纯文本，不要JSON。\n"
         f"\n上下文：\n{json.dumps(compact, ensure_ascii=False)}"
     )
 
 
 def _copilot_references(*, analysis: dict[str, Any]) -> list[dict[str, Any]]:
+    rr = analysis.get("risk_result") if isinstance(analysis.get("risk_result"), dict) else {}
     summary = analysis.get("summary") if isinstance(analysis.get("summary"), dict) else {}
     topo = analysis.get("topology_impact") if isinstance(analysis.get("topology_impact"), dict) else {}
     refs: list[dict[str, Any]] = [
-        {"type": "summary", "key": "risk_level", "value": str(summary.get("risk_level") or "-")},
+        {"type": "summary", "key": "risk_level", "value": str(rr.get("risk_level") or summary.get("risk_level") or "-")},
+        {"type": "summary", "key": "decision", "value": str(rr.get("decision") or "-")},
         {"type": "summary", "key": "detected_alarm_total", "value": int(summary.get("detected_alarm_total") or 0)},
         {"type": "impact", "key": "impacted_nodes", "value": len(topo.get("impacted_nodes") or [])},
         {"type": "impact", "key": "impacted_links", "value": len(topo.get("impacted_links") or [])},
