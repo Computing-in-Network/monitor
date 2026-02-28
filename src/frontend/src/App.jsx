@@ -2356,6 +2356,13 @@ export function App() {
   const autoNodeCandidates = faultCandidates.filter((x) => x.source === 'auto' && x.scopeType === 'node');
   const autoLinkCandidates = faultCandidates.filter((x) => x.source === 'auto' && x.scopeType === 'link');
   const directReasonText = analysisDirectReason;
+  const ruleRiskResult = (taskImpact && typeof taskImpact.risk_result === 'object') ? taskImpact.risk_result : null;
+  const evidenceBundle = (taskImpact && typeof taskImpact.evidence_bundle === 'object') ? taskImpact.evidence_bundle : null;
+  const displayRiskLevel = String(ruleRiskResult?.risk_level || taskImpact?.summary?.risk_level || taskImpact?.risk_level || '-');
+  const displayDirectReason = String(ruleRiskResult?.direct_reason || directReasonText || '').trim();
+  const evidenceFindings = Array.isArray(evidenceBundle?.top_findings) ? evidenceBundle.top_findings : [];
+  const evidenceAlarms = Array.isArray(evidenceBundle?.detected_alarms) ? evidenceBundle.detected_alarms : [];
+  const evidenceTasks = Array.isArray(evidenceBundle?.tasks_top) ? evidenceBundle.tasks_top : [];
   const reportHistoryPoints = (() => {
     if (!analysisSummary?.scopeType || !analysisSummary?.scopeId) {
       return [];
@@ -2868,45 +2875,29 @@ export function App() {
                         <span className="legend-swatch forecast"></span>LSTM预测
                       </div>
                     </div>
-                    {faultSpread ? (
-                      <div className="analysis-block">
-                        <div><strong>Topology Impact</strong></div>
-                        <div>seeds: {faultSpread.seed_nodes?.length ?? 0}, impacted_nodes: {faultSpread.impacted_nodes?.length ?? 0}</div>
-                        <div>impacted_links: {faultSpread.impacted_links?.length ?? 0}, boundary: {faultSpread.boundary_nodes?.length ?? 0}</div>
-                        <div>route_mode: {taskImpact?.topology_impact?.route_mode || '-'}, policy: {taskImpact?.topology_impact?.policy || '-'}</div>
-                        <div>rank_top: {Array.isArray(taskImpact?.topology_impact?.rank_top) ? taskImpact.topology_impact.rank_top.slice(0, 3).map((x) => `${x.link_id}(${Number(x.score || 0).toFixed(1)})`).join(' | ') : '-'}</div>
-                        <div>filtered_out: {Array.isArray(taskImpact?.topology_impact?.filtered_out) ? taskImpact.topology_impact.filtered_out.length : 0}</div>
-                      </div>
-                    ) : null}
-                    {directReasonText ? (
-                      <div className="analysis-block">
-                        <div><strong>直接原因</strong></div>
-                        <div>{directReasonText}</div>
-                      </div>
-                    ) : null}
-                    {taskImpact?.reasoning ? (
-                      <div className="analysis-block">
-                        <div><strong>判定依据</strong>: {taskImpact.reasoning.fault_domain || '-'}</div>
-                        <div>{taskImpact.reasoning.note || '-'}</div>
-                      </div>
-                    ) : null}
-                    {taskImpact?.security_correlation ? (
-                      <div className="analysis-block">
-                        <div><strong>安全联动</strong>: {taskImpact.security_correlation.level || 'none'} (score={Number(taskImpact.security_correlation.score || 0).toFixed(2)})</div>
-                        <div>security_events: {taskImpact.security_correlation.matched_security_events ?? 0}, window: {taskImpact.security_correlation.window_sec ?? '-'}s</div>
-                        <div>evidence: {Array.isArray(taskImpact.security_correlation.evidence) ? taskImpact.security_correlation.evidence.map((e) => `${e.type}:${e.detail}`).slice(0, 2).join(' | ') : '-'}</div>
-                      </div>
-                    ) : null}
-                    {taskImpact?.narrative ? (
-                      <div className="analysis-block">
-                        <div><strong>人类可读结论</strong>: {taskImpact.narrative.verdict || '-'}</div>
-                        <div>{taskImpact.narrative.summary_sentence || '-'}</div>
-                      </div>
-                    ) : null}
+                    <div className="analysis-block">
+                      <div><strong>风险预警（规则/LSTM）</strong></div>
+                      <div>risk: {displayRiskLevel}</div>
+                      <div>source: {ruleRiskResult?.source || 'rules_lstm'}</div>
+                      <div>max_severity: {ruleRiskResult?.max_alarm_severity || taskImpact?.summary?.max_alarm_severity || '-'}</div>
+                      <div>focused_severity: {ruleRiskResult?.focused_scope_severity || taskImpact?.summary?.focused_scope_severity || '-'}</div>
+                      <div>detected_alarms: {ruleRiskResult?.detected_alarm_total ?? taskImpact?.summary?.detected_alarm_total ?? '-'}</div>
+                      {displayDirectReason ? <div>直接原因: {displayDirectReason}</div> : null}
+                    </div>
+                    <div className="analysis-block">
+                      <div><strong>证据摘要</strong></div>
+                      <div>impacted_nodes: {evidenceBundle?.impacted_nodes_count ?? (faultSpread?.impacted_nodes?.length ?? 0)}</div>
+                      <div>impacted_links: {evidenceBundle?.impacted_links_count ?? (faultSpread?.impacted_links?.length ?? 0)}</div>
+                      <div>top_findings: {evidenceFindings.length}</div>
+                      <div>detected_alarms: {evidenceAlarms.length}</div>
+                      <div>tasks_top: {evidenceTasks.length}</div>
+                      <div>route_mode: {taskImpact?.topology_impact?.route_mode || '-'}, policy: {taskImpact?.topology_impact?.policy || '-'}</div>
+                      <div>security_level: {evidenceBundle?.security_correlation?.level || taskImpact?.security_correlation?.level || 'none'}</div>
+                    </div>
                     <div className="analysis-block">
                       <div><strong>AI详细报告</strong>{analysisAiMeta?.model ? ` (${analysisAiMeta.model})` : ''}</div>
-                      <div>固定信息: risk={taskImpact?.summary?.risk_level || taskImpact?.risk_level || '-'}, impacted_nodes={faultSpread?.impacted_nodes?.length ?? 0}, impacted_links={faultSpread?.impacted_links?.length ?? 0}</div>
-                      {directReasonText ? <div>固定原因: {directReasonText}</div> : null}
+                      <div>固定信息: risk={displayRiskLevel}, impacted_nodes={evidenceBundle?.impacted_nodes_count ?? (faultSpread?.impacted_nodes?.length ?? 0)}, impacted_links={evidenceBundle?.impacted_links_count ?? (faultSpread?.impacted_links?.length ?? 0)}</div>
+                      {displayDirectReason ? <div>固定原因: {displayDirectReason}</div> : null}
                       {analysisAiLoading ? <div>生成中...</div> : null}
                       {analysisAiError ? <div className="analysis-error">{analysisAiError}</div> : null}
                       {analysisAiMeta?.source === 'fallback' ? <div>当前使用规则兜底报告：{analysisAiMeta?.fallbackReason || 'ollama unavailable'}</div> : null}
