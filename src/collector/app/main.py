@@ -992,6 +992,37 @@ def create_app() -> FastAPI:
                 detected_alarms=result.get("detected_alarms") if isinstance(result.get("detected_alarms"), list) else [],
                 topology_impact=out.get("topology_impact", {}),
             )
+            findings = [
+                x for x in ((out.get("reasoning") or {}).get("top_findings") or [])
+                if isinstance(x, dict)
+            ][:10]
+            primary_finding = findings[0] if findings else {}
+            primary_evidence = [
+                str(x) for x in (primary_finding.get("evidence") or [])
+                if str(x).strip()
+            ]
+            out["risk_result"] = {
+                "source": "rules_lstm",
+                "risk_level": (out.get("summary") or {}).get("risk_level"),
+                "max_alarm_severity": (out.get("summary") or {}).get("max_alarm_severity"),
+                "focused_scope_severity": (out.get("summary") or {}).get("focused_scope_severity"),
+                "detected_alarm_total": (out.get("summary") or {}).get("detected_alarm_total"),
+                "direct_reason": "、".join(primary_evidence[:3]) if primary_evidence else None,
+                "primary_finding": primary_finding or None,
+            }
+            out["evidence_bundle"] = {
+                "scope_observation": payload.get("scope_observation") if isinstance(payload.get("scope_observation"), dict) else {},
+                "top_findings": findings,
+                "detected_alarms": [
+                    x for x in (result.get("detected_alarms") or [])
+                    if isinstance(x, dict)
+                ][:30],
+                "impacted_nodes_count": len(out.get("topology_impact", {}).get("impacted_nodes") or []),
+                "impacted_links_count": len(out.get("topology_impact", {}).get("impacted_links") or []),
+                "impacted_nodes_sample": (out.get("topology_impact", {}).get("impacted_nodes") or [])[:20],
+                "impacted_links_sample": (out.get("topology_impact", {}).get("impacted_links") or [])[:20],
+                "tasks_top": (out.get("tasks") or [])[:10],
+            }
             out["security_correlation"] = _build_security_correlation(
                 resolved=out.get("resolved", {}),
                 detected_alarms=result.get("detected_alarms") if isinstance(result.get("detected_alarms"), list) else [],
@@ -1000,6 +1031,7 @@ def create_app() -> FastAPI:
                 monitor_payload=snapshot_payload,
                 window_sec=max(60, min(int(payload.get("window_sec", 300)), 3600)),
             )
+            out["evidence_bundle"]["security_correlation"] = out.get("security_correlation") or {}
             ok = True
             return out
         finally:
@@ -1412,6 +1444,8 @@ def _build_ollama_analysis_prompt(
     topo = analysis.get("topology_impact") if isinstance(analysis.get("topology_impact"), dict) else {}
     reasoning = analysis.get("reasoning") if isinstance(analysis.get("reasoning"), dict) else {}
     narrative = analysis.get("narrative") if isinstance(analysis.get("narrative"), dict) else {}
+    risk_result = analysis.get("risk_result") if isinstance(analysis.get("risk_result"), dict) else {}
+    evidence_bundle = analysis.get("evidence_bundle") if isinstance(analysis.get("evidence_bundle"), dict) else {}
     tasks = analysis.get("tasks") if isinstance(analysis.get("tasks"), list) else []
     extra_obj = extra_context if isinstance(extra_context, dict) else {}
     obs = extra_obj.get("scope_observation") if isinstance(extra_obj.get("scope_observation"), dict) else {}
@@ -1423,6 +1457,7 @@ def _build_ollama_analysis_prompt(
         "scope_type": scope_type,
         "scope_id": scope_id,
         "risk_level": summary.get("risk_level"),
+        "risk_result": risk_result,
         "max_alarm_severity": summary.get("max_alarm_severity"),
         "focused_scope_severity": summary.get("focused_scope_severity"),
         "detected_alarm_total": summary.get("detected_alarm_total"),
@@ -1435,6 +1470,7 @@ def _build_ollama_analysis_prompt(
         "verdict": narrative.get("verdict"),
         "next_action": narrative.get("next_action"),
         "tasks_top10": tasks[:10],
+        "evidence_bundle": evidence_bundle,
         "scope_observation": obs,
         "forecast_context": fc,
         "direct_reason_hint": extra_obj.get("direct_reason"),
@@ -1443,8 +1479,9 @@ def _build_ollama_analysis_prompt(
     data_json = json.dumps(compact, ensure_ascii=False)
     return (
         "你是网络故障管理专家。请基于输入数据写一份“可执行、可验证”的诊断报告。\n"
+        "强约束：risk_result 是规则/LSTM给出的最终判级，AI不得改写、不得降级或升级该风险级别。\n"
         "要求：\n"
-        "1) 先给结论（风险级别+紧急程度）\n"
+        "1) 先给结论（沿用 risk_result 的风险级别+紧急程度）\n"
         "2) 明确“直接原因”：必须写出命中的指标名、观测值、阈值、比较关系（例如 cpu=85.6% >= 82%）\n"
         "3) 给出“证据链”：至少3条，优先使用 scope_observation 与 top_findings，不要泛泛而谈\n"
         "4) 说明影响范围：影响节点数/链路数，并点名最多5个关键对象\n"
