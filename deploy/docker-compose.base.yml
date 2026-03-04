@@ -49,5 +49,47 @@ services:
     ports:
       - "9010:9010"
 
+  topo-metric-reporter:
+    profiles: ["reporter"]
+    build:
+      context: ../src/collector
+      dockerfile: Dockerfile
+    container_name: monitor-topo-metric-reporter
+    restart: unless-stopped
+    depends_on:
+      monitor-collector:
+        condition: service_started
+    environment:
+      PYTHONUNBUFFERED: "1"
+      TOPO_WS_URL: ${TOPO_WS_URL:-ws://host.docker.internal:8765}
+      COLLECTOR_URL: http://monitor-collector:9010
+      COLLECTOR_API_TOKEN: ${COLLECTOR_API_TOKEN:-change-me}
+      TOPOLOGY_EPOCH: ${TOPOLOGY_EPOCH:-default}
+      REPORT_INTERVAL_S: ${REPORT_INTERVAL_S:-2}
+      REPORT_TIMEOUT_S: ${REPORT_TIMEOUT_S:-5}
+      REPORT_MAX_CONCURRENCY: ${REPORT_MAX_CONCURRENCY:-64}
+      REPORT_SEED: ${REPORT_SEED:-42}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    command:
+      - python
+      - scripts/topology_metric_reporter.py
+      - --topo-ws-url
+      - ${TOPO_WS_URL:-ws://host.docker.internal:8765}
+      - --collector-url
+      - ${COLLECTOR_URL:-http://monitor-collector:9010}
+      - --api-token
+      - ${COLLECTOR_API_TOKEN:-change-me}
+      - --topology-epoch
+      - ${TOPOLOGY_EPOCH:-default}
+      - --report-interval-s
+      - ${REPORT_INTERVAL_S:-2}
+      - --timeout-s
+      - ${REPORT_TIMEOUT_S:-5}
+      - --max-concurrency
+      - ${REPORT_MAX_CONCURRENCY:-64}
+      - --seed
+      - ${REPORT_SEED:-42}
+
 volumes:
   monitor_timescaledb_data:

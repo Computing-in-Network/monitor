@@ -7,6 +7,10 @@
    - 仓库根目录执行：`docker compose -f deploy/docker-compose.base.yml up -d --build`
    - 或在当前目录执行：`docker compose -f ../../deploy/docker-compose.base.yml up -d --build`
 
+4. 可选：启动持续上报器（从拓扑 WS 持续生成 node/link 指标）
+   - `docker compose -f deploy/docker-compose.base.yml --profile reporter up -d --build`
+   - 默认读取 `ws://host.docker.internal:8765` 并上报到 `http://monitor-collector:9010`
+
 ## 接口说明
 - `GET /health`：健康检查
 - `GET /metrics`：采集结果统计（`OK/DUPLICATE/INVALID_*` 等）
@@ -54,6 +58,13 @@
 - `TSDB_DSN`：Timescale 连接串
 - `TSDB_SCHEMA`：写入 schema（默认 `monitor_ts`）
 - `CORS_ALLOW_ORIGINS`：允许跨域来源（默认 `*`，多个用逗号分隔）
+- `TOPO_WS_URL`：持续上报器连接的拓扑 WS 地址（默认 `ws://host.docker.internal:8765`）
+- `COLLECTOR_URL`：持续上报器上报目标地址（默认 `http://monitor-collector:9010`）
+- `TOPOLOGY_EPOCH`：持续上报写入的 topology epoch（默认 `default`）
+- `REPORT_INTERVAL_S`：持续上报间隔秒数（默认 `2`）
+- `REPORT_TIMEOUT_S`：持续上报单请求超时秒数（默认 `5`）
+- `REPORT_MAX_CONCURRENCY`：持续上报并发（默认 `64`）
+- `REPORT_SEED`：持续上报随机种子（默认 `42`）
 
 ## Timescale 写入
 - 入站事件在发布 NATS 成功后会尝试写入 Timescale（四类表）
