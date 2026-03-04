@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from collections import deque
+import os
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
 
 from .config import load_config
 from .failed_events import FailedEventStore
@@ -19,6 +21,19 @@ def create_app() -> FastAPI:
     config = load_config()
 
     app = FastAPI(title="net-analysis collector")
+    cors_allow_origins_raw = str(os.environ.get("CORS_ALLOW_ORIGINS", "*")).strip()
+    cors_allow_origins = (
+        ["*"]
+        if cors_allow_origins_raw == "*"
+        else [item.strip() for item in cors_allow_origins_raw.split(",") if item.strip()]
+    )
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=cors_allow_origins or ["*"],
+        allow_credentials=False,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
     app.include_router(router)
 
     app.state.config = config

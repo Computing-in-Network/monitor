@@ -53,6 +53,7 @@
 - `TSDB_ENABLED`：是否启用 Timescale 写入（默认 `true`）
 - `TSDB_DSN`：Timescale 连接串
 - `TSDB_SCHEMA`：写入 schema（默认 `monitor_ts`）
+- `CORS_ALLOW_ORIGINS`：允许跨域来源（默认 `*`，多个用逗号分隔）
 
 ## Timescale 写入
 - 入站事件在发布 NATS 成功后会尝试写入 Timescale（四类表）
