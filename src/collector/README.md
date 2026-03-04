@@ -4,7 +4,8 @@
 1. 根据需要修改 `config.example.yaml`（或通过环境变量覆盖）
 2. 设置 `COLLECTOR_API_TOKEN` 与 `NATS_URL`（可选）
 3. 通过 Docker Compose 启动：
-   - `docker compose -f ../../docs/deploy/docker-compose.base.yml up -d --build`
+   - 仓库根目录执行：`docker compose -f deploy/docker-compose.base.yml up -d --build`
+   - 或在当前目录执行：`docker compose -f ../../deploy/docker-compose.base.yml up -d --build`
 
 ## 接口说明
 - `GET /health`：健康检查

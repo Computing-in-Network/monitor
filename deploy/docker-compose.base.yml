@@ -1,0 +1,53 @@
+services:
+  nats:
+    image: nats:2.10-alpine
+    container_name: monitor-nats
+    command: ["-js"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 4222"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  monitor_timescaledb:
+    image: timescale/timescaledb:latest-pg15
+    container_name: monitor-timescaledb
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: monitor
+      POSTGRES_USER: monitor
+      POSTGRES_PASSWORD: monitor123
+    volumes:
+      - monitor_timescaledb_data:/var/lib/postgresql/data
+      - ./timescaledb-init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U monitor -d monitor"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  monitor-collector:
+    build:
+      context: ../src/collector
+      dockerfile: Dockerfile
+    container_name: monitor-collector
+    restart: unless-stopped
+    depends_on:
+      nats:
+        condition: service_healthy
+      monitor_timescaledb:
+        condition: service_healthy
+    environment:
+      NET_ENV: dev
+      TOPIC_PREFIX: raw
+      NATS_URL: nats://nats:4222
+      COLLECTOR_API_TOKEN: ${COLLECTOR_API_TOKEN:-change-me}
+      TSDB_ENABLED: "true"
+      TSDB_DSN: postgresql://monitor:monitor123@monitor_timescaledb:5432/monitor
+      TSDB_SCHEMA: monitor_ts
+    ports:
+      - "9010:9010"
+
+volumes:
+  monitor_timescaledb_data:
