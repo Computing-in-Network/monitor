@@ -69,8 +69,14 @@ services:
       REPORT_TIMEOUT_S: ${REPORT_TIMEOUT_S:-5}
       REPORT_MAX_CONCURRENCY: ${REPORT_MAX_CONCURRENCY:-64}
       REPORT_SEED: ${REPORT_SEED:-42}
+      METRIC_SOURCE: ${METRIC_SOURCE:-docker}
+      NODE_MAPPING_CSV: ${NODE_MAPPING_CSV:-}
+      DOCKER_TIMEOUT_S: ${DOCKER_TIMEOUT_S:-5}
+      DOCKER_WORKERS: ${DOCKER_WORKERS:-16}
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
     command:
       - python
       - scripts/topology_metric_reporter.py
@@ -90,6 +96,14 @@ services:
       - ${REPORT_MAX_CONCURRENCY:-64}
       - --seed
       - ${REPORT_SEED:-42}
+      - --metric-source
+      - ${METRIC_SOURCE:-docker}
+      - --node-mapping-csv
+      - ${NODE_MAPPING_CSV:-}
+      - --docker-timeout-s
+      - ${DOCKER_TIMEOUT_S:-5}
+      - --docker-workers
+      - ${DOCKER_WORKERS:-16}
 
 volumes:
   monitor_timescaledb_data:

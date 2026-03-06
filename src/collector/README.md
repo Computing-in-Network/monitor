@@ -10,6 +10,7 @@
 4. 可选：启动持续上报器（从拓扑 WS 持续生成 node/link 指标）
    - `docker compose -f deploy/docker-compose.base.yml --profile reporter up -d --build`
    - 默认读取 `ws://host.docker.internal:8765` 并上报到 `http://monitor-collector:9010`
+   - 默认 `METRIC_SOURCE=docker`（通过 `/var/run/docker.sock` 采集容器 CPU/内存/网络；失败自动回退 synthetic）
 
 ## 接口说明
 - `GET /health`：健康检查
@@ -49,6 +50,17 @@
 - 示例上报：`./scripts/send_example.sh`
 - smoke 验证（401/422/200）：`./scripts/smoke_api.sh`
 
+## Docker 实采模式（reporter）
+- reporter 支持 `--metric-source docker|synthetic`
+- `docker` 模式会额外上报：
+  - `docker_name`
+  - `cpu_usage_cores`、`cpu_limit_cores`
+  - `mem_usage_bytes`、`mem_limit_bytes`
+- 容器映射优先级：
+  - `--node-mapping-csv`（`node_id,container_name,container_id`）
+  - 其次尝试 erv300 命名推断（如 `SAT-POLAR-001 -> erv300_r_1`）
+  - 最后回退 `container_name=node_id`
+
 ## 发布重试配置
 - `PUBLISH_RETRIES`：NATS 发布失败重试次数（默认 `2`）
 - `PUBLISH_RETRY_BACKOFF_MS`：重试间隔毫秒（默认 `200`）
@@ -65,6 +77,10 @@
 - `REPORT_TIMEOUT_S`：持续上报单请求超时秒数（默认 `5`）
 - `REPORT_MAX_CONCURRENCY`：持续上报并发（默认 `64`）
 - `REPORT_SEED`：持续上报随机种子（默认 `42`）
+- `METRIC_SOURCE`：上报指标来源（`docker` 或 `synthetic`，默认 `docker`）
+- `NODE_MAPPING_CSV`：可选，节点到容器映射 CSV 路径
+- `DOCKER_TIMEOUT_S`：docker 采样超时（默认 `5`）
+- `DOCKER_WORKERS`：docker 采样并发 worker（默认 `16`）
 
 ## Timescale 写入
 - 入站事件在发布 NATS 成功后会尝试写入 Timescale（四类表）
